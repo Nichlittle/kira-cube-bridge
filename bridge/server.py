@@ -54,6 +54,7 @@ AUTH = {"username": MQTT_USER, "password": MQTT_PASS}
 
 server = MCPServer(
     "kira-cube",
+    log_level="WARNING",   # no per-request access logs: they would print the secret URL path
     instructions=(
         "Kira's desk Cube: a small light on Nick's desk that is Kira's eye glow and nothing else. "
         "It shows one color at a time, pulsing: violet = relaxed/content (the default), "
