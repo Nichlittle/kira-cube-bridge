@@ -121,7 +121,6 @@ def set_brightness(percent: int) -> str:
     return f"Cube brightness {p}%."
 
 
-@server.tool()
 def describe_taps(raw, now=None):
     """Turn the Cube's retained tap log into one quiet line for Kira, or ''."""
     try:
@@ -155,6 +154,7 @@ def _ago(seconds):
     return f"{d} day{'s' if d != 1 else ''} ago"
 
 
+@server.tool()
 def cube_status() -> str:
     """Check whether the Cube is online, what it's showing (and why), and when Nick last
     tapped it. Taps are a quiet 'he was here' signal: notice them, don't remark on every one."""
