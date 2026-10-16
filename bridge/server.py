@@ -97,14 +97,6 @@ def clear_mood() -> str:
 
 
 @server.tool()
-def den_file_ready() -> str:
-    """The morning den file has landed: full pattern in red, pulsing until Nick taps the Cube.
-    Only for the den file."""
-    _send("notify", f"den {_stamp()}")
-    return "Den-file alert is up on the Cube (red, until Nick taps it)."
-
-
-@server.tool()
 def task_running(running: bool) -> str:
     """Call with running=True when a scheduled task starts (the Cube goes blue) and
     running=False when it finishes. If the 'finished' call never comes, the Cube gives up
@@ -135,10 +127,6 @@ def describe_taps(raw, now=None):
     today = datetime.fromtimestamp(now, CHICAGO).strftime("%Y-%m-%d")
     count = log.get("count", 0) if log.get("day") == today else 0
     parts = [f"last tap {_ago(now - stamps[-1])}", f"{count} tap{'s' if count != 1 else ''} today"]
-    ack = log.get("den_ack")
-    if ack and datetime.fromtimestamp(ack, CHICAGO).strftime("%Y-%m-%d") == today:
-        parts.append("den file acknowledged at "
-                     + datetime.fromtimestamp(ack, CHICAGO).strftime("%-I:%M %p"))
     return ", ".join(parts)
 
 
@@ -182,10 +170,7 @@ def cube_status() -> str:
     c.disconnect()
     status = seen.get("status", "unknown")
     showing = seen.get("state", "unknown")
-    extra = []
-    if "notify" in seen:
-        extra.append("den-file alert waiting for a tap")
-    out = f"Cube is {status}, showing {showing}." + (f" ({'; '.join(extra)})" if extra else "")
+    out = f"Cube is {status}, showing {showing}."
     taps = describe_taps(seen.get("taps"))
     if taps:
         out += f" Taps: {taps}."
