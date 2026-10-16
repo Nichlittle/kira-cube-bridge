@@ -16,4 +16,4 @@ The connector URL is `https://<host>/<CUBE_SECRET>/mcp`. Treat it like a passwor
 
 **Tools:** `set_mood`, `clear_mood`, `den_file_ready`, `task_running`, `set_brightness`, and `cube_status`.
 
-**Deploy (Render):** create a new Web Service from this repo with Runtime set to Docker, Dockerfile path `bridge/Dockerfile`, build context `.`, and the Free instance type. Add the variables above. Render sets `PORT` itself.
+**Deploy (Render):** create a new Web Service from this repo with Runtime set to Docker (the root `Dockerfile` is used by default) and the Free instance type. Add the variables above. Render sets `PORT` itself.
