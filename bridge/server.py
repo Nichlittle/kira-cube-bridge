@@ -188,6 +188,9 @@ def cube_status() -> str:
     taps = describe_taps(seen.get("taps"))
     if taps:
         out += f" Taps: {taps}."
+    info = seen.get("info", "")
+    if info.startswith("imu="):
+        out += f" Motion sensor: {info[4:]}."
     return out
 
 
