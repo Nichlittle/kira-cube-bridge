@@ -20,7 +20,7 @@ import sys
 import json
 import time
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Union
 from zoneinfo import ZoneInfo
 
 import certifi
@@ -57,11 +57,12 @@ server = MCPServer(
     log_level="WARNING",   # no per-request access logs: they would print the secret URL path
     instructions=(
         "Kira's desk Cube: a small light on Nick's desk that is Kira's eye glow and nothing else. "
-        "It shows one color at a time, pulsing: violet = relaxed/content (the default), "
+        "By day its idle state is a calm digital rain (blue, violet, pink); overnight it's a sleepy ember. "
+        "set_mood shows one of Kira's eye colors over that: violet = relaxed/content, "
         "blue = working/thinking hard, red = surprised/flustered/heated, ember = sleepy. "
-        "It already runs its own day (sleepy overnight, relaxed by day), so only call set_mood "
-        "when Kira's mood actually shifts, not every message. Use big=True only for a big shift. "
-        "A chat mood holds about 90 minutes, then the Cube goes back to its own day."
+        "Red and blue are quick reactions (about 90 seconds); violet and ember hold about 90 minutes. "
+        "Pass hold (minutes, or \"long\") for a sustained state. Only call set_mood when Kira's mood "
+        "actually shifts, not every message. Use big=True only for a big shift.\n"
     ),
 )
 
@@ -79,14 +80,38 @@ def _stamp():
 
 
 @server.tool()
-def set_mood(mood: Literal["violet", "blue", "red", "ember"], big: bool = False) -> str:
-    """Show Kira's mood as her eye glow on the Cube. violet = relaxed/content (slow pulse),
-    blue = working/thinking hard (steady pulse), red = surprised/flustered/heated (faster
-    pulse), ember = sleepy (very slow, faint). big=True plays the full pattern (ring chase,
-    bottom-up fill, then pulse) for a big mood shift; otherwise just the ring and a crossfade.
-    The mood holds about 90 minutes, then the Cube returns to its own schedule."""
-    _send("mood", f"{mood}{' full' if big else ''} {_stamp()}")
-    return f"Cube set to {mood}{' (full pattern)' if big else ''}."
+def set_mood(mood: Literal["violet", "blue", "red", "ember"], big: bool = False,
+             hold: Union[Literal["long"], float, None] = None) -> str:
+    """Show Kira's mood as her eye glow on the Cube, over its idle digital rain.
+    violet = relaxed/content (slow pulse), blue = working/thinking hard (steady pulse),
+    red = surprised/flustered/heated (faster pulse), ember = sleepy (very slow, faint).
+    big=True plays the full pattern (ring chase, bottom-up fill, then pulse) for a big shift;
+    otherwise just the ring and a crossfade.
+
+    How long it shows before the Cube falls back to the rain:
+    - red and blue are quick reactions: about 90 seconds by default.
+    - violet and ember are held states: about 90 minutes by default.
+    - hold overrides that for this one call: a number of minutes (e.g. 30 for a long
+      research session), or "long" for 90 minutes.
+    Setting the same mood again during a hold restarts its timer and replays the ring."""
+    if hold is None:
+        seconds = None
+    elif hold == "long":
+        seconds = 90 * 60
+    else:
+        try:
+            seconds = int(float(hold) * 60)
+        except (TypeError, ValueError):
+            raise ToolError("hold must be a number of minutes or \"long\".")
+        if not 1 <= seconds <= 12 * 3600:
+            raise ToolError("hold must be between 1 second and 12 hours (720 minutes).")
+    parts = [mood] + (["full"] if big else []) + ([f"hold={seconds}"] if seconds else [])
+    _send("mood", f"{' '.join(parts)} {_stamp()}")
+    if seconds:
+        length = f"for {seconds // 60} min" if seconds >= 60 else f"for {seconds} s"
+    else:
+        length = "for about 90 s" if mood in ("red", "blue") else "for about 90 min"
+    return f"Cube set to {mood}{' (full pattern)' if big else ''} {length}."
 
 
 @server.tool()
