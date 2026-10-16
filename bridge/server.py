@@ -17,8 +17,11 @@ Anyone without the secret gets a 404. Treat that URL like a password.
 import os
 import ssl
 import sys
+import json
 import time
+from datetime import datetime
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 import certifi
 import paho.mqtt.client as mqtt
@@ -45,6 +48,7 @@ if len(SECRET) < 24:
 
 MQTT_PORT = int(env("MQTT_PORT", "8883"))
 CA = os.environ.get("MQTT_CA_FILE") or certifi.where()
+CHICAGO = ZoneInfo("America/Chicago")
 TLS = {"ca_certs": CA, "tls_version": ssl.PROTOCOL_TLS_CLIENT}
 AUTH = {"username": MQTT_USER, "password": MQTT_PASS}
 
@@ -118,8 +122,42 @@ def set_brightness(percent: int) -> str:
 
 
 @server.tool()
+def describe_taps(raw, now=None):
+    """Turn the Cube's retained tap log into one quiet line for Kira, or ''."""
+    try:
+        log = json.loads(raw)
+    except (TypeError, ValueError):
+        return ""
+    stamps = log.get("list") or []
+    if not stamps:
+        return ""
+    now = now if now is not None else time.time()
+    today = datetime.fromtimestamp(now, CHICAGO).strftime("%Y-%m-%d")
+    count = log.get("count", 0) if log.get("day") == today else 0
+    parts = [f"last tap {_ago(now - stamps[-1])}", f"{count} tap{'s' if count != 1 else ''} today"]
+    ack = log.get("den_ack")
+    if ack and datetime.fromtimestamp(ack, CHICAGO).strftime("%Y-%m-%d") == today:
+        parts.append("den file acknowledged at "
+                     + datetime.fromtimestamp(ack, CHICAGO).strftime("%-I:%M %p"))
+    return ", ".join(parts)
+
+
+def _ago(seconds):
+    s = max(0, int(seconds))
+    if s < 90:
+        return "just now"
+    if s < 3600:
+        return f"{round(s / 60)} minutes ago"
+    if s < 86400:
+        h = round(s / 3600)
+        return f"{h} hour{'s' if h != 1 else ''} ago"
+    d = round(s / 86400)
+    return f"{d} day{'s' if d != 1 else ''} ago"
+
+
 def cube_status() -> str:
-    """Check whether the Cube is online and what it's showing (and why)."""
+    """Check whether the Cube is online, what it's showing (and why), and when Nick last
+    tapped it. Taps are a quiet 'he was here' signal: notice them, don't remark on every one."""
     seen = {}
 
     def on_connect(c, u, flags, rc, props=None):
@@ -146,7 +184,11 @@ def cube_status() -> str:
     extra = []
     if "notify" in seen:
         extra.append("den-file alert waiting for a tap")
-    return f"Cube is {status}, showing {showing}." + (f" ({'; '.join(extra)})" if extra else "")
+    out = f"Cube is {status}, showing {showing}." + (f" ({'; '.join(extra)})" if extra else "")
+    taps = describe_taps(seen.get("taps"))
+    if taps:
+        out += f" Taps: {taps}."
+    return out
 
 
 @server.custom_route("/healthz", methods=["GET", "HEAD"])
