@@ -23,6 +23,6 @@ The connector URL is `https://<host>/<CUBE_SECRET>/mcp`. Treat it like a passwor
 
 `mood` is `rain`, `violet`, `blue`, `red`, `ember` or `off_duty` (or `null` if the Cube hasn't reported yet); `source` is `schedule`, `chat`, `task` or `off_duty`. `updated` is when the bridge last saw the state change. `screen` is the den screen's 1-4 lines as last set with `set_den_screen` (kept as a retained message on the broker, so it survives restarts), or `null`. No tap data, device details or secrets ever go in it. Browsers may read it only from `https://nichlittle.github.io` (override with the optional `DEN_ORIGIN` variable), and responses are never cached.
 
-**Tools:** `set_mood`, `clear_mood`, `task_running`, `set_brightness`, `cube_status`, and `set_den_screen` (the den page's THINKING ABOUT lines).
+**Tools:** `set_mood`, `clear_mood`, `task_running`, `set_brightness`, `cube_status`, plus the den tools: `den_state` (read everything the den page shows), `set_den_screen` (the THINKING ABOUT lines), `set_den_look` (today's look), `add_den_look` / `remove_den_look` (the closet of rendered looks) and `set_den_brief` (the morning brief). The den's content is kept as retained messages under `den/` on the broker, so it survives restarts.
 
 **Deploy (Render):** create a new Web Service from this repo with Runtime set to Docker (the root `Dockerfile` is used by default) and the Free instance type. Add the variables above. Render sets `PORT` itself.

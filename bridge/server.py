@@ -36,6 +36,7 @@ import paho.mqtt.client as mqtt
 import paho.mqtt.publish as publish
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
 
 def env(name, default=None):
@@ -221,35 +222,64 @@ async def healthz(request):
 
 
 # ---------------------------------------------------------------------------
-# Den page feed: GET /den/state
+# Kira's den: the Cube's mood plus the den page's daily content.
 #
-# Public and read-only, so it carries the mood and the den screen and nothing else: no tap times or
-# counts, no device info. One long-lived MQTT subscriber (started on the first
-# request) keeps the Cube's retained status/state in memory, so each poll from
-# the page is a dictionary read instead of a fresh broker connection.
+# One long-lived MQTT subscriber (started on first use) keeps the Cube's retained
+# status/state and the den's retained topics in memory, so reads are dictionary
+# lookups instead of fresh broker connections. Everything the den shows lives on
+# the broker as retained messages, so it survives Render restarts:
+#   den/screen   {"items": [...], "set": t}      the THINKING ABOUT lines
+#   den/look     {"look": name, "set": t}        today's rendered look
+#   den/brief    {"markdown": str, "set": t}     the morning brief
+#   den/closet   {"looks": [{name, note, added}]} looks that have renders
+# The private den page (a claude.ai artifact) reads all of it with den_state.
+# GET /den/state is the older public feed (mood and screen only); it goes away
+# once the GitHub-hosted den is retired.
 # ---------------------------------------------------------------------------
 DEN_ORIGIN = os.environ.get("DEN_ORIGIN", "https://nichlittle.github.io")
 DEN_MOODS = ("rain", "violet", "blue", "red", "ember")
 DEN_SOURCES = ("schedule", "chat", "task")
 DEN_WARMUP_S = 3  # after a cold start, wait this long at most for the retained values
-DEN_SCREEN_TOPIC = "den/screen"   # retained JSON: {"items": [...], "set": <unix time>}
+DEN_SCREEN_TOPIC = "den/screen"
+DEN_LOOK_TOPIC = "den/look"
+DEN_BRIEF_TOPIC = "den/brief"
+DEN_CLOSET_TOPIC = "den/closet"
 DEN_SCREEN_MAX_ITEMS = 4
 DEN_SCREEN_MAX_CHARS = 40
+DEN_LOOK_NAME_MAX = 60
+DEN_LOOK_NOTE_MAX = 200
+DEN_CLOSET_MAX = 200
+DEN_BRIEF_MAX = 30000
 
-_den = {"status": None, "state": None, "updated": None, "started": None, "screen": None}
+_den = {"status": None, "state": None, "updated": None, "started": None, "connected": None,
+        "screen": None, "look": None, "brief": None, "closet": None}
 _den_lock = threading.Lock()
 
 
 def _den_on_connect(c, u, flags, rc, props=None):
-    c.subscribe([(f"{PREFIX}/status", 0), (f"{PREFIX}/state", 0),
-                 (f"{PREFIX}/{DEN_SCREEN_TOPIC}", 0)])
+    c.subscribe([(f"{PREFIX}/status", 0), (f"{PREFIX}/state", 0), (f"{PREFIX}/den/#", 0)])
+    _den["connected"] = time.time()
+
+
+def _json(raw):
+    try:
+        v = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def _clean_line(text, limit):
+    text = "".join(ch if ch.isprintable() else (" " if ch.isspace() else "") for ch in text)
+    return " ".join(text.split())[:limit]
+
+
+def _clean_screen_item(text):
+    return _clean_line(text, DEN_SCREEN_MAX_CHARS)
 
 
 def _den_parse_screen(raw):
-    try:
-        items = json.loads(raw).get("items")
-    except (TypeError, ValueError, AttributeError):
-        return None
+    items = (_json(raw) or {}).get("items")
     if not isinstance(items, list):
         return None
     clean = [_clean_screen_item(i) for i in items if isinstance(i, str)]
@@ -257,9 +287,20 @@ def _den_parse_screen(raw):
     return clean or None
 
 
-def _clean_screen_item(text):
-    text = "".join(ch if ch.isprintable() else (" " if ch.isspace() else "") for ch in text)
-    return " ".join(text.split())[:DEN_SCREEN_MAX_CHARS]
+def _den_parse_closet(raw):
+    looks = (_json(raw) or {}).get("looks")
+    if not isinstance(looks, list):
+        return []
+    out = []
+    for item in looks:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            continue
+        name = _clean_line(item["name"], DEN_LOOK_NAME_MAX)
+        if name:
+            note = item.get("note") if isinstance(item.get("note"), str) else ""
+            added = item.get("added") if isinstance(item.get("added"), int) else None
+            out.append({"name": name, "note": _clean_line(note, DEN_LOOK_NOTE_MAX), "added": added})
+    return out[:DEN_CLOSET_MAX]
 
 
 def _den_on_message(c, u, m):
@@ -267,13 +308,21 @@ def _den_on_message(c, u, m):
     value = m.payload.decode(errors="replace").strip() if m.payload else None
     if key == DEN_SCREEN_TOPIC:
         _den["screen"] = _den_parse_screen(value) if value else None
-        return
-    if key not in ("status", "state"):
-        return
-    if _den.get(key) != value:
-        _den[key] = value
-        if key == "state":
-            _den["updated"] = time.time()
+    elif key == DEN_LOOK_TOPIC:
+        look = (_json(value) or {}).get("look") if value else None
+        _den["look"] = _clean_line(look, DEN_LOOK_NAME_MAX) if isinstance(look, str) and look else None
+    elif key == DEN_BRIEF_TOPIC:
+        b = _json(value) if value else None
+        md = b.get("markdown") if b else None
+        _den["brief"] = ({"markdown": md[:DEN_BRIEF_MAX], "set": b.get("set")}
+                         if isinstance(md, str) and md.strip() else None)
+    elif key == DEN_CLOSET_TOPIC:
+        _den["closet"] = _den_parse_closet(value) if value else []
+    elif key in ("status", "state"):
+        if _den.get(key) != value:
+            _den[key] = value
+            if key == "state":
+                _den["updated"] = time.time()
 
 
 def _den_start():
@@ -290,9 +339,21 @@ def _den_start():
         _den["started"] = time.time()
 
 
+def _den_ready_blocking():
+    """Start the subscriber and give the broker a moment to hand back retained values.
+    Returns True once the subscriber has been connected for at least a second."""
+    _den_start()
+    deadline = _den["started"] + DEN_WARMUP_S
+    while time.time() < deadline:
+        if _den["connected"] and time.time() - _den["connected"] >= 1.0:
+            return True
+        time.sleep(0.1)
+    return bool(_den["connected"])
+
+
 def den_state(status, state, updated, now=None, screen=None):
     """Turn the Cube's retained status/state strings (and the den screen) into the
-    page's small JSON."""
+    public feed's small JSON."""
     s = (state or "").strip().lower()
     paren = re.search(r"\(([^)]*)\)", s)
     src = paren.group(1).strip() if paren else ""
@@ -312,10 +373,19 @@ def den_state(status, state, updated, now=None, screen=None):
     }
 
 
+def den_snapshot():
+    """Everything the private den page shows, as one dict."""
+    body = den_state(_den["status"], _den["state"], _den["updated"], screen=_den["screen"])
+    body["look"] = _den["look"]
+    body["brief"] = _den["brief"]
+    body["closet"] = list(_den["closet"] or [])
+    return body
+
+
 @server.custom_route("/den/state", methods=["GET", "HEAD"])
 async def den_state_route(request):
-    """Public, read-only mood for the den page. Only nichlittle.github.io may read it
-    from a browser."""
+    """Public, read-only mood for the old GitHub-hosted den page. Only
+    nichlittle.github.io may read it from a browser."""
     from starlette.responses import JSONResponse
     _den_start()
     while _den["state"] is None and time.time() - _den["started"] < DEN_WARMUP_S:
@@ -328,13 +398,21 @@ async def den_state_route(request):
     })
 
 
+@server.tool(name="den_state", annotations=ToolAnnotations(readOnlyHint=True))
+def den_state_tool() -> dict:
+    """Read everything Kira's private den page shows: the Cube's mood (mood, source,
+    online, updated), the THINKING ABOUT lines (screen), today's look (look), the morning
+    brief (brief: {markdown, set}) and the closet of rendered looks (closet: [{name, note,
+    added}]). Read-only."""
+    _den_ready_blocking()
+    return den_snapshot()
+
+
 @server.tool()
 def set_den_screen(items: list[str]) -> str:
-    """Put the day's THINKING ABOUT lines on Kira's live den page (nichlittle.github.io/den/).
-    Pass 1-4 short lines (3-6 words each works best), exactly as they should read on the
-    screen. They replace whatever was there and stay until the next call. The den page is
-    PUBLIC: anyone with the link can read these lines, so keep them fine for strangers
-    (nothing about Nick's family, relationships, or anything private)."""
+    """Put the day's THINKING ABOUT lines on Kira's den page. Pass 1-4 short lines
+    (3-6 words each works best), exactly as they should read on the screen. They replace
+    whatever was there and stay until the next call."""
     clean = [_clean_screen_item(i) for i in items if isinstance(i, str)]
     clean = [i for i in clean if i]
     if not clean:
@@ -346,6 +424,89 @@ def set_den_screen(items: list[str]) -> str:
     trimmed = any(len(" ".join(i.split())) > DEN_SCREEN_MAX_CHARS for i in items if isinstance(i, str))
     note = f" (lines are capped at {DEN_SCREEN_MAX_CHARS} characters; one was trimmed)" if trimmed else ""
     return f"Den screen set: {' / '.join(clean)}{note}."
+
+
+def _closet_now():
+    if not _den_ready_blocking():
+        raise ToolError("Couldn't reach the Cube's MQTT broker to read the closet; nothing changed.")
+    return list(_den["closet"] or [])
+
+
+def _find_look(closet, name):
+    want = _clean_line(name or "", DEN_LOOK_NAME_MAX).casefold()
+    for item in closet:
+        if item["name"].casefold() == want:
+            return item
+    return None
+
+
+@server.tool()
+def set_den_look(name: str) -> str:
+    """Choose today's look on Kira's den page. `name` must match a look in the closet
+    (see den_state's closet list; case doesn't matter)."""
+    closet = _closet_now()
+    item = _find_look(closet, name)
+    if not item:
+        names = ", ".join(i["name"] for i in closet) or "(the closet is empty)"
+        raise ToolError(f"No look named {name!r} in the closet. Looks: {names}")
+    _send(DEN_LOOK_TOPIC, json.dumps({"look": item["name"], "set": int(time.time())}))
+    _den["look"] = item["name"]
+    return f"Today's look: {item['name']}."
+
+
+@server.tool()
+def add_den_look(name: str, note: str = "") -> str:
+    """Add a rendered look to the den's closet (or update its note if it's already there).
+    The den page calls this when Nick uploads a render; `note` is a short description the
+    morning task can use when picking (outfit, pose, vibe)."""
+    clean = _clean_line(name or "", DEN_LOOK_NAME_MAX)
+    if not clean:
+        raise ToolError("Give the look a name.")
+    note = _clean_line(note or "", DEN_LOOK_NOTE_MAX)
+    closet = _closet_now()
+    item = _find_look(closet, clean)
+    if item:
+        item["note"] = note or item["note"]
+    else:
+        if len(closet) >= DEN_CLOSET_MAX:
+            raise ToolError(f"The closet holds at most {DEN_CLOSET_MAX} looks.")
+        closet.append({"name": clean, "note": note, "added": int(time.time())})
+    _send(DEN_CLOSET_TOPIC, json.dumps({"looks": closet}))
+    _den["closet"] = closet
+    return f"{'Updated' if item else 'Added'} {clean!r}; the closet has {len(closet)} look{'s' if len(closet) != 1 else ''}."
+
+
+@server.tool()
+def remove_den_look(name: str) -> str:
+    """Take a look out of the den's closet (the render itself stays in the den page's
+    storage). If it was today's look, the page falls back to the empty room."""
+    closet = _closet_now()
+    item = _find_look(closet, name)
+    if not item:
+        raise ToolError(f"No look named {name!r} in the closet.")
+    closet = [i for i in closet if i is not item]
+    _send(DEN_CLOSET_TOPIC, json.dumps({"looks": closet}))
+    _den["closet"] = closet
+    if _den["look"] and _den["look"].casefold() == item["name"].casefold():
+        _send(DEN_LOOK_TOPIC, "")
+        _den["look"] = None
+    return f"Removed {item['name']!r}; the closet has {len(closet)} look{'s' if len(closet) != 1 else ''}."
+
+
+@server.tool()
+def set_den_brief(markdown: str) -> str:
+    """Post the morning brief (weather, outfit picks, news) to Kira's den page, below the
+    room. Markdown: headings, bold, bullet lists and links render. Replaces the previous
+    brief."""
+    md = (markdown or "").strip()
+    if not md:
+        raise ToolError("The brief is empty.")
+    if len(md) > DEN_BRIEF_MAX:
+        raise ToolError(f"The brief is too long ({len(md)} characters; max {DEN_BRIEF_MAX}).")
+    stamp = int(time.time())
+    _send(DEN_BRIEF_TOPIC, json.dumps({"markdown": md, "set": stamp}))
+    _den["brief"] = {"markdown": md, "set": stamp}
+    return f"Brief posted to the den ({len(md)} characters)."
 
 
 if __name__ == "__main__":
