@@ -229,6 +229,8 @@ async def healthz(request):
 #   den/look     {"look": name, "set": t}        today's rendered look
 #   den/brief    {"markdown": str, "set": t}     the morning brief
 #   den/closet   {"looks": [{name, note, added}]} looks that have renders
+#   den/weather  {"sky": ..., "temp_f": n, "set": t} today's Chicago sky for the room
+#   den/wishlist {"items": [{name, pitch, prompt, status, added}]} Kira's outfit pitches
 # The private den page (a claude.ai artifact) reads all of it with the den_state
 # tool; nothing about the den is served publicly.
 # ---------------------------------------------------------------------------
@@ -245,9 +247,18 @@ DEN_LOOK_NAME_MAX = 60
 DEN_LOOK_NOTE_MAX = 200
 DEN_CLOSET_MAX = 200
 DEN_BRIEF_MAX = 30000
+DEN_WEATHER_TOPIC = "den/weather"
+DEN_WISHLIST_TOPIC = "den/wishlist"
+DEN_SKIES = ("clear", "cloudy", "drizzle", "rain", "storm", "snow")
+DEN_WISH_STATUSES = ("open", "cut", "rendered")
+DEN_WISH_PITCH_MAX = 300
+DEN_WISH_PROMPT_MAX = 4000
+DEN_WISH_OPEN_MAX = 12   # pitches waiting on Nick at once
+DEN_WISHLIST_MAX = 150   # including cut and rendered ones, kept so nothing is pitched twice
 
 _den = {"status": None, "state": None, "updated": None, "started": None, "connected": None,
-        "screen": None, "look": None, "brief": None, "closet": None}
+        "screen": None, "look": None, "brief": None, "closet": None,
+        "weather": None, "wishlist": None}
 _den_lock = threading.Lock()
 
 
@@ -298,6 +309,35 @@ def _den_parse_closet(raw):
     return out[:DEN_CLOSET_MAX]
 
 
+def _den_parse_weather(raw):
+    w = _json(raw)
+    if not w or w.get("sky") not in DEN_SKIES:
+        return None
+    t = w.get("temp_f")
+    return {"sky": w["sky"], "temp_f": t if isinstance(t, int) else None,
+            "set": w.get("set") if isinstance(w.get("set"), int) else None}
+
+
+def _den_parse_wishlist(raw):
+    items = (_json(raw) or {}).get("items")
+    if not isinstance(items, list):
+        return []
+    out = []
+    for it in items:
+        if not isinstance(it, dict) or not isinstance(it.get("name"), str):
+            continue
+        name = _clean_line(it["name"], DEN_LOOK_NAME_MAX)
+        if not name:
+            continue
+        pitch = it.get("pitch") if isinstance(it.get("pitch"), str) else ""
+        prompt = it.get("prompt") if isinstance(it.get("prompt"), str) else ""
+        status = it.get("status") if it.get("status") in DEN_WISH_STATUSES else "open"
+        added = it.get("added") if isinstance(it.get("added"), int) else None
+        out.append({"name": name, "pitch": _clean_line(pitch, DEN_WISH_PITCH_MAX),
+                    "prompt": prompt.strip()[:DEN_WISH_PROMPT_MAX], "status": status, "added": added})
+    return out[:DEN_WISHLIST_MAX]
+
+
 def _den_on_message(c, u, m):
     key = m.topic[len(PREFIX) + 1:]
     value = m.payload.decode(errors="replace").strip() if m.payload else None
@@ -313,6 +353,10 @@ def _den_on_message(c, u, m):
                          if isinstance(md, str) and md.strip() else None)
     elif key == DEN_CLOSET_TOPIC:
         _den["closet"] = _den_parse_closet(value) if value else []
+    elif key == DEN_WEATHER_TOPIC:
+        _den["weather"] = _den_parse_weather(value) if value else None
+    elif key == DEN_WISHLIST_TOPIC:
+        _den["wishlist"] = _den_parse_wishlist(value) if value else []
     elif key in ("status", "state"):
         if _den.get(key) != value:
             _den[key] = value
@@ -374,6 +418,11 @@ def den_snapshot():
     body["look"] = _den["look"]
     body["brief"] = _den["brief"]
     body["closet"] = list(_den["closet"] or [])
+    body["weather"] = _den["weather"]
+    wl = list(_den["wishlist"] or [])
+    body["wishlist"] = [i for i in wl if i["status"] == "open"]
+    body["wishlist_cut"] = [i["name"] for i in wl if i["status"] == "cut"]
+    body["wishlist_rendered"] = [i["name"] for i in wl if i["status"] == "rendered"]
     return body
 
 
@@ -381,8 +430,11 @@ def den_snapshot():
 def den_state_tool() -> dict:
     """Read everything Kira's private den page shows: the Cube's mood (mood, source,
     online, updated), the THINKING ABOUT lines (screen), today's look (look), the morning
-    brief (brief: {markdown, set}) and the closet of rendered looks (closet: [{name, note,
-    added}]). Read-only."""
+    brief (brief: {markdown, set}), the closet of rendered looks (closet: [{name, note,
+    added}]), today's weather for the room (weather: {sky, temp_f, set}), Kira's open
+    outfit pitches (wishlist: [{name, pitch, prompt, status, added}]) and the names of
+    pitches Nick cut (wishlist_cut: never pitch these again) or already rendered
+    (wishlist_rendered). Read-only."""
     _den_ready_blocking()
     return den_snapshot()
 
@@ -486,6 +538,87 @@ def set_den_brief(markdown: str) -> str:
     _send(DEN_BRIEF_TOPIC, json.dumps({"markdown": md, "set": stamp}))
     _den["brief"] = {"markdown": md, "set": stamp}
     return f"Brief posted to the den ({len(md)} characters)."
+
+
+@server.tool()
+def set_den_weather(sky: str, temp_f: int | None = None) -> str:
+    """Set today's Chicago sky for Kira's den: the city screen rains, drizzles, storms,
+    snows or clears to match, and a cold temp_f frosts the glass. sky is one of clear,
+    cloudy, drizzle, rain, storm, snow. The morning brief task sets it from the forecast."""
+    sky = (sky or "").strip().lower()
+    if sky not in DEN_SKIES:
+        raise ToolError(f"sky must be one of: {', '.join(DEN_SKIES)}.")
+    if temp_f is not None and not -60 <= int(temp_f) <= 130:
+        raise ToolError("temp_f looks wrong; give degrees Fahrenheit.")
+    w = {"sky": sky, "temp_f": int(temp_f) if temp_f is not None else None, "set": int(time.time())}
+    _send(DEN_WEATHER_TOPIC, json.dumps(w))
+    _den["weather"] = w
+    t = f", {w['temp_f']}°F" if w["temp_f"] is not None else ""
+    return f"Den weather: {sky}{t}."
+
+
+def _wishlist_now():
+    if not _den_ready_blocking():
+        raise ToolError("Couldn't reach the Cube's MQTT broker to read the wishlist; nothing changed.")
+    return [dict(i) for i in (_den["wishlist"] or [])]
+
+
+def _save_wishlist(wl):
+    _send(DEN_WISHLIST_TOPIC, json.dumps({"items": wl}))
+    _den["wishlist"] = wl
+
+
+@server.tool()
+def add_den_suggestion(name: str, pitch: str, prompt: str) -> str:
+    """Pitch a new outfit for Kira's wardrobe on the den page's Wishlist. name: a short
+    look name. pitch: one or two lines in Kira's voice on what it is and why. prompt: the
+    full ready-to-paste Grok image prompt (base block, outfit, den setting, pose,
+    expression, style lock, negatives). Nick copies the prompt to render it, or cuts it.
+    Names he has cut or already rendered are refused, so nothing is pitched twice."""
+    clean = _clean_line(name or "", DEN_LOOK_NAME_MAX)
+    if not clean:
+        raise ToolError("Give the pitch a name.")
+    pitch = _clean_line(pitch or "", DEN_WISH_PITCH_MAX)
+    prompt = (prompt or "").strip()
+    if not prompt:
+        raise ToolError("Include the Grok prompt.")
+    if len(prompt) > DEN_WISH_PROMPT_MAX:
+        raise ToolError(f"The prompt is too long ({len(prompt)} characters; max {DEN_WISH_PROMPT_MAX}).")
+    wl = _wishlist_now()
+    for i in wl:
+        if i["name"].casefold() == clean.casefold():
+            if i["status"] != "open":
+                raise ToolError(f"{i['name']!r} was already {i['status']}; pitch something new.")
+            i.update(pitch=pitch, prompt=prompt)
+            _save_wishlist(wl)
+            return f"Updated the pitch {i['name']!r}."
+    if sum(1 for i in wl if i["status"] == "open") >= DEN_WISH_OPEN_MAX:
+        raise ToolError(f"The wishlist already has {DEN_WISH_OPEN_MAX} open pitches; wait for Nick to work through some.")
+    wl.append({"name": clean, "pitch": pitch, "prompt": prompt, "status": "open", "added": int(time.time())})
+    if len(wl) > DEN_WISHLIST_MAX:  # drop the oldest rendered ones first; cut ones are the memory
+        for status in ("rendered", "cut"):
+            while len(wl) > DEN_WISHLIST_MAX and any(i["status"] == status for i in wl):
+                wl.remove(next(i for i in wl if i["status"] == status))
+    _save_wishlist(wl)
+    n = sum(1 for i in wl if i["status"] == "open")
+    return f"Pitched {clean!r}; {n} open pitch{'es' if n != 1 else ''} on the wishlist."
+
+
+@server.tool()
+def resolve_den_suggestion(name: str, status: str) -> str:
+    """Close a Wishlist pitch. status 'cut' = Nick passed ("not my vibe"; never pitch it
+    again), 'rendered' = he made it and it's in the closet now, 'open' = put it back."""
+    status = (status or "").strip().lower()
+    if status not in DEN_WISH_STATUSES:
+        raise ToolError(f"status must be one of: {', '.join(DEN_WISH_STATUSES)}.")
+    wl = _wishlist_now()
+    want = _clean_line(name or "", DEN_LOOK_NAME_MAX).casefold()
+    for i in wl:
+        if i["name"].casefold() == want:
+            i["status"] = status
+            _save_wishlist(wl)
+            return f"{i['name']!r} marked {status}."
+    raise ToolError(f"No pitch named {name!r} on the wishlist.")
 
 
 if __name__ == "__main__":
