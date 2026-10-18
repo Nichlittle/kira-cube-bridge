@@ -17,7 +17,7 @@ Anyone without the secret gets a 404. Treat that URL like a password.
 Two public, secret-free routes sit beside it:
   GET /healthz      "I'm awake" for the host and a keep-warm pinger
   GET /den/state    the Cube's current mood, read-only, for the den page on
-                    nichlittle.github.io (mood, source, online, updated; nothing else)
+                    nichlittle.github.io (mood, source, online, updated, screen; nothing else)
 """
 import os
 import re
@@ -223,7 +223,7 @@ async def healthz(request):
 # ---------------------------------------------------------------------------
 # Den page feed: GET /den/state
 #
-# Public and read-only, so it carries the mood and nothing else: no tap times or
+# Public and read-only, so it carries the mood and the den screen and nothing else: no tap times or
 # counts, no device info. One long-lived MQTT subscriber (started on the first
 # request) keeps the Cube's retained status/state in memory, so each poll from
 # the page is a dictionary read instead of a fresh broker connection.
@@ -232,20 +232,44 @@ DEN_ORIGIN = os.environ.get("DEN_ORIGIN", "https://nichlittle.github.io")
 DEN_MOODS = ("rain", "violet", "blue", "red", "ember")
 DEN_SOURCES = ("schedule", "chat", "task")
 DEN_WARMUP_S = 3  # after a cold start, wait this long at most for the retained values
+DEN_SCREEN_TOPIC = "den/screen"   # retained JSON: {"items": [...], "set": <unix time>}
+DEN_SCREEN_MAX_ITEMS = 4
+DEN_SCREEN_MAX_CHARS = 40
 
-_den = {"status": None, "state": None, "updated": None, "started": None}
+_den = {"status": None, "state": None, "updated": None, "started": None, "screen": None}
 _den_lock = threading.Lock()
 
 
 def _den_on_connect(c, u, flags, rc, props=None):
-    c.subscribe([(f"{PREFIX}/status", 0), (f"{PREFIX}/state", 0)])
+    c.subscribe([(f"{PREFIX}/status", 0), (f"{PREFIX}/state", 0),
+                 (f"{PREFIX}/{DEN_SCREEN_TOPIC}", 0)])
+
+
+def _den_parse_screen(raw):
+    try:
+        items = json.loads(raw).get("items")
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if not isinstance(items, list):
+        return None
+    clean = [_clean_screen_item(i) for i in items if isinstance(i, str)]
+    clean = [i for i in clean if i][:DEN_SCREEN_MAX_ITEMS]
+    return clean or None
+
+
+def _clean_screen_item(text):
+    text = "".join(ch if ch.isprintable() else (" " if ch.isspace() else "") for ch in text)
+    return " ".join(text.split())[:DEN_SCREEN_MAX_CHARS]
 
 
 def _den_on_message(c, u, m):
     key = m.topic[len(PREFIX) + 1:]
+    value = m.payload.decode(errors="replace").strip() if m.payload else None
+    if key == DEN_SCREEN_TOPIC:
+        _den["screen"] = _den_parse_screen(value) if value else None
+        return
     if key not in ("status", "state"):
         return
-    value = m.payload.decode(errors="replace").strip() if m.payload else None
     if _den.get(key) != value:
         _den[key] = value
         if key == "state":
@@ -266,8 +290,9 @@ def _den_start():
         _den["started"] = time.time()
 
 
-def den_state(status, state, updated, now=None):
-    """Turn the Cube's retained status/state strings into the page's small JSON."""
+def den_state(status, state, updated, now=None, screen=None):
+    """Turn the Cube's retained status/state strings (and the den screen) into the
+    page's small JSON."""
     s = (state or "").strip().lower()
     paren = re.search(r"\(([^)]*)\)", s)
     src = paren.group(1).strip() if paren else ""
@@ -283,6 +308,7 @@ def den_state(status, state, updated, now=None):
         "source": source,
         "online": (status or "").strip().lower() == "online",
         "updated": datetime.fromtimestamp(stamp, CHICAGO).isoformat(timespec="seconds"),
+        "screen": list(screen) if screen else None,
     }
 
 
@@ -294,12 +320,32 @@ async def den_state_route(request):
     _den_start()
     while _den["state"] is None and time.time() - _den["started"] < DEN_WARMUP_S:
         await asyncio.sleep(0.1)
-    body = den_state(_den["status"], _den["state"], _den["updated"])
+    body = den_state(_den["status"], _den["state"], _den["updated"], screen=_den["screen"])
     return JSONResponse(body, headers={
         "Access-Control-Allow-Origin": DEN_ORIGIN,
         "Vary": "Origin",
         "Cache-Control": "no-store",
     })
+
+
+@server.tool()
+def set_den_screen(items: list[str]) -> str:
+    """Put the day's THINKING ABOUT lines on Kira's live den page (nichlittle.github.io/den/).
+    Pass 1-4 short lines (3-6 words each works best), exactly as they should read on the
+    screen. They replace whatever was there and stay until the next call. The den page is
+    PUBLIC: anyone with the link can read these lines, so keep them fine for strangers
+    (nothing about Nick's family, relationships, or anything private)."""
+    clean = [_clean_screen_item(i) for i in items if isinstance(i, str)]
+    clean = [i for i in clean if i]
+    if not clean:
+        raise ToolError("Give at least one non-empty line.")
+    if len(clean) > DEN_SCREEN_MAX_ITEMS:
+        raise ToolError(f"The screen holds at most {DEN_SCREEN_MAX_ITEMS} lines.")
+    _send(DEN_SCREEN_TOPIC, json.dumps({"items": clean, "set": int(time.time())}))
+    _den["screen"] = clean  # the cached subscriber would catch it too; this skips the wait
+    trimmed = any(len(" ".join(i.split())) > DEN_SCREEN_MAX_CHARS for i in items if isinstance(i, str))
+    note = f" (lines are capped at {DEN_SCREEN_MAX_CHARS} characters; one was trimmed)" if trimmed else ""
+    return f"Den screen set: {' / '.join(clean)}{note}."
 
 
 if __name__ == "__main__":
