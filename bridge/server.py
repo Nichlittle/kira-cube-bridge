@@ -13,12 +13,20 @@ Settings come from environment variables:
 The connector URL you paste into Claude is:
   https://<your-host>/<CUBE_SECRET>/mcp
 Anyone without the secret gets a 404. Treat that URL like a password.
+
+Two public, secret-free routes sit beside it:
+  GET /healthz      "I'm awake" for the host and a keep-warm pinger
+  GET /den/state    the Cube's current mood, read-only, for the den page on
+                    nichlittle.github.io (mood, source, online, updated; nothing else)
 """
 import os
+import re
 import ssl
 import sys
 import json
 import time
+import asyncio
+import threading
 from datetime import datetime
 from typing import Literal, Union
 from zoneinfo import ZoneInfo
@@ -210,6 +218,88 @@ async def healthz(request):
     """Public, secret-free 'I'm awake' check for the host and a keep-warm pinger."""
     from starlette.responses import PlainTextResponse
     return PlainTextResponse("ok")
+
+
+# ---------------------------------------------------------------------------
+# Den page feed: GET /den/state
+#
+# Public and read-only, so it carries the mood and nothing else: no tap times or
+# counts, no device info. One long-lived MQTT subscriber (started on the first
+# request) keeps the Cube's retained status/state in memory, so each poll from
+# the page is a dictionary read instead of a fresh broker connection.
+# ---------------------------------------------------------------------------
+DEN_ORIGIN = os.environ.get("DEN_ORIGIN", "https://nichlittle.github.io")
+DEN_MOODS = ("rain", "violet", "blue", "red", "ember")
+DEN_SOURCES = ("schedule", "chat", "task")
+DEN_WARMUP_S = 3  # after a cold start, wait this long at most for the retained values
+
+_den = {"status": None, "state": None, "updated": None, "started": None}
+_den_lock = threading.Lock()
+
+
+def _den_on_connect(c, u, flags, rc, props=None):
+    c.subscribe([(f"{PREFIX}/status", 0), (f"{PREFIX}/state", 0)])
+
+
+def _den_on_message(c, u, m):
+    key = m.topic[len(PREFIX) + 1:]
+    if key not in ("status", "state"):
+        return
+    value = m.payload.decode(errors="replace").strip() if m.payload else None
+    if _den.get(key) != value:
+        _den[key] = value
+        if key == "state":
+            _den["updated"] = time.time()
+
+
+def _den_start():
+    with _den_lock:
+        if _den["started"] is not None:
+            return
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv311)
+        c.username_pw_set(MQTT_USER, MQTT_PASS)
+        c.tls_set(ca_certs=CA)
+        c.on_connect, c.on_message = _den_on_connect, _den_on_message
+        c.reconnect_delay_set(min_delay=1, max_delay=60)
+        c.connect_async(MQTT_HOST, MQTT_PORT)
+        c.loop_start()  # paho keeps reconnecting on its own if the broker drops
+        _den["started"] = time.time()
+
+
+def den_state(status, state, updated, now=None):
+    """Turn the Cube's retained status/state strings into the page's small JSON."""
+    s = (state or "").strip().lower()
+    paren = re.search(r"\(([^)]*)\)", s)
+    src = paren.group(1).strip() if paren else ""
+    first = s.split(" ", 1)[0] if s else ""
+    if "off" in s and "duty" in s:
+        mood, source = "off_duty", "off_duty"
+    else:
+        mood = first if first in DEN_MOODS else None
+        source = src if src in DEN_SOURCES else ("schedule" if mood == "rain" else None)
+    stamp = updated if updated is not None else (now if now is not None else time.time())
+    return {
+        "mood": mood,
+        "source": source,
+        "online": (status or "").strip().lower() == "online",
+        "updated": datetime.fromtimestamp(stamp, CHICAGO).isoformat(timespec="seconds"),
+    }
+
+
+@server.custom_route("/den/state", methods=["GET", "HEAD"])
+async def den_state_route(request):
+    """Public, read-only mood for the den page. Only nichlittle.github.io may read it
+    from a browser."""
+    from starlette.responses import JSONResponse
+    _den_start()
+    while _den["state"] is None and time.time() - _den["started"] < DEN_WARMUP_S:
+        await asyncio.sleep(0.1)
+    body = den_state(_den["status"], _den["state"], _den["updated"])
+    return JSONResponse(body, headers={
+        "Access-Control-Allow-Origin": DEN_ORIGIN,
+        "Vary": "Origin",
+        "Cache-Control": "no-store",
+    })
 
 
 if __name__ == "__main__":
