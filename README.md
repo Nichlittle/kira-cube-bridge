@@ -14,15 +14,6 @@ There are no secrets in this repo. Everything private comes from environment var
 
 The connector URL is `https://<host>/<CUBE_SECRET>/mcp`. Treat it like a password. `GET /healthz` is a public "I'm awake" check for the keep-warm pinger.
 
-`GET /den/state` is a public, read-only feed for Kira's den page (nichlittle.github.io/den/). It returns the Cube's current mood and the den screen's lines, nothing else:
-
-```json
-{"mood": "rain", "source": "schedule", "online": true, "updated": "2026-10-18T10:45:00-05:00",
- "screen": ["MY ROOM FOLLOWS MY EYES", "THE DEN IS LIVE"]}
-```
-
-`mood` is `rain`, `violet`, `blue`, `red`, `ember` or `off_duty` (or `null` if the Cube hasn't reported yet); `source` is `schedule`, `chat`, `task` or `off_duty`. `updated` is when the bridge last saw the state change. `screen` is the den screen's 1-4 lines as last set with `set_den_screen` (kept as a retained message on the broker, so it survives restarts), or `null`. No tap data, device details or secrets ever go in it. Browsers may read it only from `https://nichlittle.github.io` (override with the optional `DEN_ORIGIN` variable), and responses are never cached.
-
 **Tools:** `set_mood`, `clear_mood`, `task_running`, `set_brightness`, `cube_status`, plus the den tools: `den_state` (read everything the den page shows), `set_den_screen` (the THINKING ABOUT lines), `set_den_look` (today's look), `add_den_look` / `remove_den_look` (the closet of rendered looks) and `set_den_brief` (the morning brief). The den's content is kept as retained messages under `den/` on the broker, so it survives restarts.
 
 **Deploy (Render):** create a new Web Service from this repo with Runtime set to Docker (the root `Dockerfile` is used by default) and the Free instance type. Add the variables above. Render sets `PORT` itself.

@@ -14,10 +14,8 @@ The connector URL you paste into Claude is:
   https://<your-host>/<CUBE_SECRET>/mcp
 Anyone without the secret gets a 404. Treat that URL like a password.
 
-Two public, secret-free routes sit beside it:
+One public, secret-free route sits beside it:
   GET /healthz      "I'm awake" for the host and a keep-warm pinger
-  GET /den/state    the Cube's current mood, read-only, for the den page on
-                    nichlittle.github.io (mood, source, online, updated, screen; nothing else)
 """
 import os
 import re
@@ -25,7 +23,6 @@ import ssl
 import sys
 import json
 import time
-import asyncio
 import threading
 from datetime import datetime
 from typing import Literal, Union
@@ -232,11 +229,9 @@ async def healthz(request):
 #   den/look     {"look": name, "set": t}        today's rendered look
 #   den/brief    {"markdown": str, "set": t}     the morning brief
 #   den/closet   {"looks": [{name, note, added}]} looks that have renders
-# The private den page (a claude.ai artifact) reads all of it with den_state.
-# GET /den/state is the older public feed (mood and screen only); it goes away
-# once the GitHub-hosted den is retired.
+# The private den page (a claude.ai artifact) reads all of it with the den_state
+# tool; nothing about the den is served publicly.
 # ---------------------------------------------------------------------------
-DEN_ORIGIN = os.environ.get("DEN_ORIGIN", "https://nichlittle.github.io")
 DEN_MOODS = ("rain", "violet", "blue", "red", "ember")
 DEN_SOURCES = ("schedule", "chat", "task")
 DEN_WARMUP_S = 3  # after a cold start, wait this long at most for the retained values
@@ -353,7 +348,7 @@ def _den_ready_blocking():
 
 def den_state(status, state, updated, now=None, screen=None):
     """Turn the Cube's retained status/state strings (and the den screen) into the
-    public feed's small JSON."""
+    mood half of the den's JSON."""
     s = (state or "").strip().lower()
     paren = re.search(r"\(([^)]*)\)", s)
     src = paren.group(1).strip() if paren else ""
@@ -380,22 +375,6 @@ def den_snapshot():
     body["brief"] = _den["brief"]
     body["closet"] = list(_den["closet"] or [])
     return body
-
-
-@server.custom_route("/den/state", methods=["GET", "HEAD"])
-async def den_state_route(request):
-    """Public, read-only mood for the old GitHub-hosted den page. Only
-    nichlittle.github.io may read it from a browser."""
-    from starlette.responses import JSONResponse
-    _den_start()
-    while _den["state"] is None and time.time() - _den["started"] < DEN_WARMUP_S:
-        await asyncio.sleep(0.1)
-    body = den_state(_den["status"], _den["state"], _den["updated"], screen=_den["screen"])
-    return JSONResponse(body, headers={
-        "Access-Control-Allow-Origin": DEN_ORIGIN,
-        "Vary": "Origin",
-        "Cache-Control": "no-store",
-    })
 
 
 @server.tool(name="den_state", annotations=ToolAnnotations(readOnlyHint=True))
