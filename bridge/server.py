@@ -64,11 +64,13 @@ server = MCPServer(
     instructions=(
         "Kira's desk Cube: a small light on Nick's desk that is Kira's eye glow and nothing else. "
         "By day its idle state is a calm digital rain (blue, violet, pink); overnight it's a sleepy ember. "
-        "set_mood shows one of Kira's eye colors over that: violet = relaxed/content, "
+        "set_mood shows one of Kira's eye colors over that idle: violet = a warm, content moment "
+        "(not the default and not a reset), "
         "blue = working/thinking hard, red = surprised/flustered/heated, ember = sleepy. "
         "Red and blue are quick reactions (about 90 seconds); violet and ember hold about 90 minutes. "
         "Pass hold (minutes, or \"long\") for a sustained state. Only call set_mood when Kira's mood "
-        "actually shifts, not every message. Use big=True only for a big shift.\n"
+        "actually shifts, not every message. Use big=True only for a big shift. To go back to "
+        "baseline when a moment has passed, call clear_mood; don't set violet for that.\n"
     ),
 )
 
@@ -89,7 +91,8 @@ def _stamp():
 def set_mood(mood: Literal["violet", "blue", "red", "ember"], big: bool = False,
              hold: Union[Literal["long"], float, None] = None) -> str:
     """Show Kira's mood as her eye glow on the Cube, over its idle digital rain.
-    violet = relaxed/content (slow pulse), blue = working/thinking hard (steady pulse),
+    Every mood covers the rain (or overnight ember) until it expires; none is "back to normal".
+    violet = a warm, content moment (slow pulse; not the default), blue = working/thinking hard (steady pulse),
     red = surprised/flustered/heated (faster pulse), ember = sleepy (very slow, faint).
     big=True plays the full pattern (ring chase, bottom-up fill, then pulse) for a big shift;
     otherwise just the ring and a crossfade.
@@ -123,7 +126,9 @@ def set_mood(mood: Literal["violet", "blue", "red", "ember"], big: bool = False,
 
 @server.tool()
 def clear_mood() -> str:
-    """Hand the Cube back to its own day (sleepy overnight, relaxed by day) right away."""
+    """Hand the Cube back to its own idle right away: digital rain by day, ember overnight.
+    This is the "back to baseline" call when a moment has passed. Use it instead of
+    setting violet."""
     _send("mood", "auto")
     _send(DEN_EYES_TOPIC, "")
     return "Cube is back on its own schedule."
