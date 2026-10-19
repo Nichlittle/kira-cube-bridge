@@ -621,7 +621,56 @@ def resolve_den_suggestion(name: str, status: str) -> str:
     raise ToolError(f"No pitch named {name!r} on the wishlist.")
 
 
+# ---------------------------------------------------------------------------
+# Evening ember (Nick, Oct 18): night should start at 8:30 p.m., but the Cube's own
+# clock (in its firmware) still switches to ember at 11 p.m. Until the firmware is
+# reflashed, this keeper covers the gap: between EVENING_EMBER_START and the firmware's
+# night start, whenever the Cube reports its daytime idle ("rain (schedule)"), it sends
+# ember held until the firmware takes over. Chat moods, tasks and off duty are left
+# alone; after a quick reaction expires the Cube falls back to rain and the keeper
+# re-asserts ember within a minute. Once the firmware switches at 8:30 itself, the Cube
+# never reports rain in that window and this does nothing.
+# ---------------------------------------------------------------------------
+def _hhmm(text, default):
+    try:
+        h, m = (int(x) for x in str(text).split(":"))
+        return h * 60 + m
+    except (TypeError, ValueError):
+        return default
+
+
+EVENING_EMBER_START = _hhmm(os.environ.get("EVENING_EMBER_START", "20:30"), 20 * 60 + 30)
+FIRMWARE_NIGHT_START = _hhmm(os.environ.get("FIRMWARE_NIGHT_START", "23:00"), 23 * 60)
+KEEPER_EVERY_S = 60
+
+
+def evening_ember_due(state, now_dt):
+    """Seconds of ember to send right now, or 0. `state` is the Cube's retained state
+    string (e.g. "rain (schedule)"); `now_dt` an aware Chicago datetime."""
+    t = now_dt.hour * 60 + now_dt.minute
+    if not (EVENING_EMBER_START <= t < FIRMWARE_NIGHT_START):
+        return 0
+    s = (state or "").strip().lower()
+    if not (s.startswith("rain") and "(schedule)" in s):
+        return 0
+    return max(60, (FIRMWARE_NIGHT_START - t) * 60 - now_dt.second)
+
+
+def _evening_keeper():
+    while True:
+        try:
+            _den_ready_blocking()
+            secs = evening_ember_due(_den["state"], datetime.now(CHICAGO))
+            if secs:
+                _send("mood", f"ember hold={secs} {_stamp()}")
+                _den["state"] = "ember (chat)"  # don't resend before the Cube reports back
+        except Exception:
+            pass  # broker hiccup; try again next minute
+        time.sleep(KEEPER_EVERY_S)
+
+
 if __name__ == "__main__":
+    threading.Thread(target=_evening_keeper, name="evening-ember", daemon=True).start()
     server.run(
         "streamable-http",
         host="0.0.0.0",
