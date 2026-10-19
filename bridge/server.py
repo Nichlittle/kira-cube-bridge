@@ -113,6 +113,7 @@ def set_mood(mood: Literal["violet", "blue", "red", "ember"], big: bool = False,
             raise ToolError("hold must be between 1 second and 12 hours (720 minutes).")
     parts = [mood] + (["full"] if big else []) + ([f"hold={seconds}"] if seconds else [])
     _send("mood", f"{' '.join(parts)} {_stamp()}")
+    _den_set_eyes(mood, seconds or (90 if mood in ("red", "blue") else 90 * 60))
     if seconds:
         length = f"for {seconds // 60} min" if seconds >= 60 else f"for {seconds} s"
     else:
@@ -124,6 +125,7 @@ def set_mood(mood: Literal["violet", "blue", "red", "ember"], big: bool = False,
 def clear_mood() -> str:
     """Hand the Cube back to its own day (sleepy overnight, relaxed by day) right away."""
     _send("mood", "auto")
+    _send(DEN_EYES_TOPIC, "")
     return "Cube is back on its own schedule."
 
 
@@ -231,6 +233,9 @@ async def healthz(request):
 #   den/closet   {"looks": [{name, note, added}]} looks that have renders
 #   den/weather  {"sky": ..., "temp_f": n, "set": t} today's Chicago sky for the room
 #   den/wishlist {"items": [{name, pitch, prompt, status, added}]} Kira's outfit pitches
+#   den/eyes     {"mood": m, "set": t, "until": t}  Kira's own eye glow, written by set_mood
+# The room's mood comes from den/eyes (what Kira chose), never from the Cube's reported
+# state; with no live eye color it follows the clock (rain by day, ember 8:30 p.m.-6:30 a.m.).
 # The private den page (a claude.ai artifact) reads all of it with the den_state
 # tool; nothing about the den is served publicly.
 # ---------------------------------------------------------------------------
@@ -249,6 +254,10 @@ DEN_CLOSET_MAX = 200
 DEN_BRIEF_MAX = 30000
 DEN_WEATHER_TOPIC = "den/weather"
 DEN_WISHLIST_TOPIC = "den/wishlist"
+DEN_EYES_TOPIC = "den/eyes"
+DEN_EYE_MOODS = ("violet", "blue", "red", "ember")
+DEN_NIGHT_START = 20 * 60 + 30
+DEN_NIGHT_END = 6 * 60 + 30
 DEN_SKIES = ("clear", "cloudy", "drizzle", "rain", "storm", "snow")
 DEN_WISH_STATUSES = ("open", "cut", "rendered")
 DEN_WISH_PITCH_MAX = 300
@@ -258,7 +267,7 @@ DEN_WISHLIST_MAX = 150   # including cut and rendered ones, kept so nothing is p
 
 _den = {"status": None, "state": None, "updated": None, "started": None, "connected": None,
         "screen": None, "look": None, "brief": None, "closet": None,
-        "weather": None, "wishlist": None}
+        "weather": None, "wishlist": None, "eyes": None}
 _den_lock = threading.Lock()
 
 
@@ -357,6 +366,10 @@ def _den_on_message(c, u, m):
         _den["weather"] = _den_parse_weather(value) if value else None
     elif key == DEN_WISHLIST_TOPIC:
         _den["wishlist"] = _den_parse_wishlist(value) if value else []
+    elif key == DEN_EYES_TOPIC:
+        e = _json(value) if value else None
+        _den["eyes"] = (e if e and e.get("mood") in DEN_EYE_MOODS
+                        and isinstance(e.get("until"), (int, float)) else None)
     elif key in ("status", "state"):
         if _den.get(key) != value:
             _den[key] = value
@@ -412,9 +425,29 @@ def den_state(status, state, updated, now=None, screen=None):
     }
 
 
+def _den_set_eyes(mood, seconds):
+    now = int(time.time())
+    eyes = {"mood": mood, "set": now, "until": now + int(seconds)}
+    _send(DEN_EYES_TOPIC, json.dumps(eyes))
+    _den["eyes"] = eyes
+
+
+def den_eyes_mood(eyes, now_dt):
+    """The room's mood from Kira's last eye color, or the clock when none is live."""
+    if eyes and eyes.get("until", 0) > now_dt.timestamp():
+        return eyes["mood"], "chat", eyes.get("set")
+    t = now_dt.hour * 60 + now_dt.minute
+    night = t >= DEN_NIGHT_START or t < DEN_NIGHT_END
+    return ("ember" if night else "rain"), "schedule", None
+
+
 def den_snapshot():
     """Everything the private den page shows, as one dict."""
     body = den_state(_den["status"], _den["state"], _den["updated"], screen=_den["screen"])
+    mood, source, stamp = den_eyes_mood(_den["eyes"], datetime.now(CHICAGO))
+    body["mood"], body["source"] = mood, source
+    if stamp:
+        body["updated"] = datetime.fromtimestamp(stamp, CHICAGO).isoformat(timespec="seconds")
     body["look"] = _den["look"]
     body["brief"] = _den["brief"]
     body["closet"] = list(_den["closet"] or [])
@@ -428,8 +461,9 @@ def den_snapshot():
 
 @server.tool(name="den_state", annotations=ToolAnnotations(readOnlyHint=True))
 def den_state_tool() -> dict:
-    """Read everything Kira's private den page shows: the Cube's mood (mood, source,
-    online, updated), the THINKING ABOUT lines (screen), today's look (look), the morning
+    """Read everything Kira's private den page shows: the room's mood (mood, source,
+    updated: Kira's own last set_mood color while it lasts, otherwise the clock; online
+    only says whether the Cube is plugged in), the THINKING ABOUT lines (screen), today's look (look), the morning
     brief (brief: {markdown, set}), the closet of rendered looks (closet: [{name, note,
     added}]), today's weather for the room (weather: {sky, temp_f, set}), Kira's open
     outfit pitches (wishlist: [{name, pitch, prompt, status, added}]) and the names of
