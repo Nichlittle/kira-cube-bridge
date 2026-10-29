@@ -478,6 +478,30 @@ def den_state_tool() -> dict:
     return den_snapshot()
 
 
+@server.tool(name="den_summary", annotations=ToolAnnotations(readOnlyHint=True))
+def den_summary_tool() -> dict:
+    """Light read of the den: today's look, the THINKING ABOUT lines (screen), the weather,
+    the room's mood, when the brief was last set (brief_set, a Unix timestamp), and counts
+    for the closet and open Wishlist pitches. It leaves out the brief text, the closet
+    notes and the Wishlist prompts, so it is much cheaper than den_state. Use it for
+    routine checks and on-demand updates; use den_state only when you need the closet
+    notes (picking a look) or the Wishlist. Read-only."""
+    _den_ready_blocking()
+    snap = den_snapshot()
+    brief = snap.get("brief") or {}
+    return {
+        "mood": snap["mood"],
+        "source": snap["source"],
+        "online": snap["online"],
+        "look": snap["look"],
+        "screen": snap["screen"],
+        "weather": snap["weather"],
+        "brief_set": brief.get("set"),
+        "closet_count": len(snap["closet"]),
+        "open_pitches": len(snap["wishlist"]),
+    }
+
+
 @server.tool()
 def set_den_screen(items: list[str]) -> str:
     """Put the day's THINKING ABOUT lines on Kira's den page. Pass 1-4 short lines
@@ -594,6 +618,75 @@ def set_den_weather(sky: str, temp_f: int | None = None) -> str:
     _den["weather"] = w
     t = f", {w['temp_f']}°F" if w["temp_f"] is not None else ""
     return f"Den weather: {sky}{t}."
+
+
+@server.tool()
+def den_update(look: str | None = None, screen: list[str] | None = None,
+               sky: str | None = None, temp_f: int | None = None,
+               brief: str | None = None) -> str:
+    """Update several parts of the den in one call. Every argument is optional, but pass at
+    least one: look (a closet look name), screen (1-4 THINKING ABOUT lines), sky (with an
+    optional temp_f), brief (the morning brief markdown). Everything is checked before
+    anything is written, so a bad argument changes nothing. Parts you leave out stay as
+    they are. The single-purpose tools (set_den_look, set_den_screen, set_den_weather,
+    set_den_brief) still work the same way."""
+    if look is None and screen is None and sky is None and brief is None:
+        raise ToolError("Pass at least one of look, screen, sky or brief.")
+    if temp_f is not None and sky is None:
+        raise ToolError("temp_f goes with sky; pass sky too.")
+
+    item = None
+    if look is not None:
+        closet = _closet_now()
+        item = _find_look(closet, look)
+        if not item:
+            names = ", ".join(i["name"] for i in closet) or "(the closet is empty)"
+            raise ToolError(f"No look named {look!r} in the closet. Looks: {names}")
+
+    clean_screen = None
+    if screen is not None:
+        clean_screen = [c for c in (_clean_screen_item(i) for i in screen if isinstance(i, str)) if c]
+        if not clean_screen:
+            raise ToolError("Give at least one non-empty screen line.")
+        if len(clean_screen) > DEN_SCREEN_MAX_ITEMS:
+            raise ToolError(f"The screen holds at most {DEN_SCREEN_MAX_ITEMS} lines.")
+
+    sky_clean = None
+    if sky is not None:
+        sky_clean = sky.strip().lower()
+        if sky_clean not in DEN_SKIES:
+            raise ToolError(f"sky must be one of: {', '.join(DEN_SKIES)}.")
+        if temp_f is not None and not -60 <= int(temp_f) <= 130:
+            raise ToolError("temp_f looks wrong; give degrees Fahrenheit.")
+
+    md = None
+    if brief is not None:
+        md = brief.strip()
+        if not md:
+            raise ToolError("The brief is empty.")
+        if len(md) > DEN_BRIEF_MAX:
+            raise ToolError(f"The brief is too long ({len(md)} characters; max {DEN_BRIEF_MAX}).")
+
+    stamp = int(time.time())
+    done = []
+    if item:
+        _send(DEN_LOOK_TOPIC, json.dumps({"look": item["name"], "set": stamp}))
+        _den["look"] = item["name"]
+        done.append(f"look: {item['name']}")
+    if clean_screen:
+        _send(DEN_SCREEN_TOPIC, json.dumps({"items": clean_screen, "set": stamp}))
+        _den["screen"] = clean_screen
+        done.append(f"screen: {' / '.join(clean_screen)}")
+    if sky_clean:
+        w = {"sky": sky_clean, "temp_f": int(temp_f) if temp_f is not None else None, "set": stamp}
+        _send(DEN_WEATHER_TOPIC, json.dumps(w))
+        _den["weather"] = w
+        done.append(f"weather: {sky_clean}" + (f", {w['temp_f']}°F" if w["temp_f"] is not None else ""))
+    if md:
+        _send(DEN_BRIEF_TOPIC, json.dumps({"markdown": md, "set": stamp}))
+        _den["brief"] = {"markdown": md, "set": stamp}
+        done.append(f"brief ({len(md)} characters)")
+    return "Den updated. " + "; ".join(done) + "."
 
 
 def _wishlist_now():
