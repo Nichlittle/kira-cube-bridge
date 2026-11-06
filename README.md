@@ -11,6 +11,11 @@ There are no secrets in this repo. Everything private comes from environment var
 | `MQTT_USER` / `MQTT_PASS` | the bridge's EMQX login (`kira-bridge`) |
 | `TOPIC_PREFIX` | the same prefix as the cube's `config.py` |
 | `CUBE_SECRET` | a long random string; it is the lock on the URL |
+| `XAI_API_KEY` | optional: the xAI key for renders (image + files permissions only) |
+| `XAI_REF_FILES` | optional: the two reference images' xAI file ids, comma-separated (`tools/upload-refs.sh` prints them) |
+| `RENDER_DAILY_CAP_USD` | optional: render spend cap per Chicago day, default `0.50` |
+
+**Renders:** `render_quote` (free) prices a Grok Imagine render with the reference images; `render_image` runs it only after Nick says yes, `render_review` approves (with a closet name) or rejects it, and the den page collects approved ones with `render_inbox` / `render_fetch` / `render_filed`. The spend ledger is the retained `den/renders` message; prompts and images never go in this repo.
 
 The connector URL is `https://<host>/<CUBE_SECRET>/mcp`. Treat it like a password. `GET /healthz` is a public "I'm awake" check for the keep-warm pinger.
 

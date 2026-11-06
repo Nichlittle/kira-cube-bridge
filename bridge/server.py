@@ -23,7 +23,12 @@ import ssl
 import sys
 import json
 import time
+import base64
+import secrets
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from typing import Literal, Union
 from zoneinfo import ZoneInfo
@@ -31,7 +36,7 @@ from zoneinfo import ZoneInfo
 import certifi
 import paho.mqtt.client as mqtt
 import paho.mqtt.publish as publish
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Image, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
@@ -71,6 +76,8 @@ server = MCPServer(
         "Pass hold (minutes, or \"long\") for a sustained state. Only call set_mood when Kira's mood "
         "actually shifts, not every message. Use big=True only for a big shift. To go back to "
         "baseline when a moment has passed, call clear_mood; don't set violet for that.\n"
+        "Renders cost money: render_quote first (free), show Nick the price, and call "
+        "render_image only after he says yes to that quote. Never retry render_image on your own.\n"
     ),
 )
 
@@ -272,7 +279,7 @@ DEN_WISHLIST_MAX = 150   # including cut and rendered ones, kept so nothing is p
 
 _den = {"status": None, "state": None, "updated": None, "started": None, "connected": None,
         "screen": None, "look": None, "brief": None, "closet": None,
-        "weather": None, "wishlist": None, "eyes": None}
+        "weather": None, "wishlist": None, "eyes": None, "renders": None}
 _den_lock = threading.Lock()
 
 
@@ -375,6 +382,8 @@ def _den_on_message(c, u, m):
         e = _json(value) if value else None
         _den["eyes"] = (e if e and e.get("mood") in DEN_EYE_MOODS
                         and isinstance(e.get("until"), (int, float)) else None)
+    elif key == RENDER_TOPIC:
+        _den["renders"] = _render_parse(value) if value else None
     elif key in ("status", "state"):
         if _den.get(key) != value:
             _den[key] = value
@@ -584,6 +593,7 @@ def remove_den_look(name: str) -> str:
     if _den["look"] and _den["look"].casefold() == item["name"].casefold():
         _send(DEN_LOOK_TOPIC, "")
         _den["look"] = None
+    _render_forget_look(item["name"])
     return f"Removed {item['name']!r}; the closet has {len(closet)} look{'s' if len(closet) != 1 else ''}."
 
 
@@ -751,6 +761,448 @@ def resolve_den_suggestion(name: str, status: str) -> str:
             _save_wishlist(wl)
             return f"{i['name']!r} marked {status}."
     raise ToolError(f"No pitch named {name!r} on the wishlist.")
+
+
+# ---------------------------------------------------------------------------
+# Renders (Nov 5): Grok Imagine through xAI's API, driven from the Kira chat.
+#
+#   render_quote  (free)      price a render; returns a quote id good for 10 minutes
+#   render_image  (spends)    run a quote Nick said yes to; returns the image + a link
+#   render_review             approve (with a closet name) or reject; reject deletes it
+#   render_inbox / render_fetch / render_filed
+#                             the den page collects approved renders, saves them to its
+#                             own storage and the closet, then marks them filed
+#
+# Spend and the render list live in the retained den/renders message, so the daily cap
+# survives restarts. Nothing is written to this server's disk. Images go to xAI as base64
+# data URIs (the request shape tested by hand on Nov 5); renders and Nick's references
+# are kept in xAI's Files API by file id. The key is only ever sent to api.x.ai.
+#
+# Env: XAI_API_KEY (needs image + files permissions), XAI_REF_FILES (comma-separated
+# file ids of the reference images), optional RENDER_DAILY_CAP_USD (default 0.50) and
+# XAI_IMAGE_MODEL (default grok-imagine-image-2.0). Without the key or references the
+# render tools say so; every other tool works as before.
+# ---------------------------------------------------------------------------
+XAI_KEY = os.environ.get("XAI_API_KEY", "").strip()
+XAI_BASE = "https://api.x.ai/v1"
+XAI_MODEL = os.environ.get("XAI_IMAGE_MODEL", "grok-imagine-image-2.0").strip()
+XAI_REF_FILES = [f.strip() for f in os.environ.get("XAI_REF_FILES", "").split(",") if f.strip()]
+try:
+    RENDER_DAILY_CAP = float(os.environ.get("RENDER_DAILY_CAP_USD", "0.50"))
+except ValueError:
+    RENDER_DAILY_CAP = 0.50
+RENDER_TOPIC = "den/renders"
+RENDER_PROMPT_MAX = 4000
+RENDER_PROMPT_KEEP = 300          # how much of a prompt the ledger remembers
+RENDER_MAX_IMAGES = 3             # xAI's widely documented limit (one page says 5)
+RENDER_INPUT_USD = 0.01
+RENDER_OUTPUT_USD_EST = 0.06      # seen Nov 5 at default quality; the real cost comes back in usage
+TICKS_PER_USD = 10_000_000_000    # usage.cost_in_usd_ticks: the $0.08 test came back as 800000000
+RENDER_QUOTE_TTL_S = 600
+RENDER_PENDING_DAYS = 7           # unreviewed renders are deleted at xAI after this
+RENDER_KEEP_CLOSED = 30           # rejected/withheld/failed entries kept as spend history
+RENDER_ITEMS_MAX = 260
+RENDER_HTTP_UA = "kira-cube-bridge/1"
+RENDER_OPEN = ("pending", "approved", "filed")
+RENDER_CLOSED = ("rejected", "withheld", "failed", "unknown", "unsaved")
+
+_render_lock = threading.Lock()
+_quotes = {}       # quote id -> what was priced; memory only, a quote is a 10-minute promise
+_ref_cache = {}    # reference file id -> bytes, so references are fetched once per boot
+
+
+class _XaiError(Exception):
+    def __init__(self, code, detail):
+        super().__init__(f"xAI {code}")
+        self.code, self.detail = code, detail
+
+
+def _render_parse(raw):
+    r = _json(raw) or {}
+    items = r.get("items") if isinstance(r.get("items"), list) else []
+    return {"day": r.get("day") if isinstance(r.get("day"), str) else "",
+            "spent": r.get("spent") if isinstance(r.get("spent"), int) else 0,
+            "count": r.get("count") if isinstance(r.get("count"), int) else 0,
+            "items": [dict(i) for i in items if isinstance(i, dict) and isinstance(i.get("id"), str)]}
+
+
+def _today():
+    return datetime.now(CHICAGO).strftime("%Y-%m-%d")
+
+
+def _usd(ticks):
+    return ticks / TICKS_PER_USD
+
+
+def _render_now():
+    """The ledger as it stands (a copy), rolled over to today."""
+    if not _den_ready_blocking():
+        raise ToolError("Couldn't reach the Cube's MQTT broker to read the render ledger; nothing was spent.")
+    r = _den.get("renders") or {"day": "", "spent": 0, "count": 0, "items": []}
+    r = {"day": r["day"], "spent": r["spent"], "count": r["count"], "items": [dict(i) for i in r["items"]]}
+    if r["day"] != _today():
+        r.update(day=_today(), spent=0, count=0)
+    return r
+
+
+def _render_save(r):
+    _send(RENDER_TOPIC, json.dumps(r, separators=(",", ":")))
+    _den["renders"] = r
+
+
+def _render_prune(r, now):
+    """Drop stale entries; returns xAI file ids to delete (after the ledger is saved)."""
+    doomed, keep = [], []
+    for i in r["items"]:
+        if i.get("status") == "pending" and now - (i.get("created") or now) > RENDER_PENDING_DAYS * 86400:
+            doomed.append(i)
+        else:
+            keep.append(i)
+    closed = [i for i in keep if i.get("status") in RENDER_CLOSED]
+    old = closed[:-RENDER_KEEP_CLOSED] if len(closed) > RENDER_KEEP_CLOSED else []
+    r["items"] = [i for i in keep if not any(i is o for o in old)]
+    return [i["file_id"] for i in doomed + old if i.get("file_id")]
+
+
+def _render_find(items, ref, statuses=RENDER_OPEN):
+    """A stored render by id, or by the closet name it was approved under."""
+    want = (ref or "").strip()
+    for i in reversed(items):
+        if i.get("id") == want and i.get("status") in statuses:
+            return i
+    name = _clean_line(want, DEN_LOOK_NAME_MAX).casefold()
+    for i in reversed(items):
+        if name and (i.get("look") or "").casefold() == name and i.get("status") in statuses:
+            return i
+    return None
+
+
+def _xai(method, path, body=None, content_type="application/json", timeout=60, raw=False):
+    if not XAI_KEY:
+        raise ToolError("Renders aren't set up yet: XAI_API_KEY is missing on the server.")
+    headers = {"Authorization": f"Bearer {XAI_KEY}", "User-Agent": RENDER_HTTP_UA}
+    if body is not None:
+        headers["Content-Type"] = content_type
+    req = urllib.request.Request(XAI_BASE + path, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read()[:300].decode(errors="replace")
+        raise _XaiError(e.code, " ".join(detail.split())) from None
+    if raw:
+        return data
+    return json.loads(data) if data else {}
+
+
+def _xai_reason(e):
+    hint = {401: "xAI refused the key (check XAI_API_KEY)",
+            403: "xAI refused the request (the key needs image and files permissions)",
+            402: "xAI says the prepaid credit is used up",
+            429: "xAI's rate limit (the key allows only a few requests a minute); wait a minute"}
+    return f"{hint.get(e.code, f'xAI error {e.code}')}: {e.detail}" if e.detail else hint.get(e.code, f"xAI error {e.code}")
+
+
+def _fetch_public(url, timeout=60):
+    """Download xAI's temporary image link. No key: it is a different host."""
+    if not url.startswith("https://"):
+        raise ToolError("xAI returned an image link that isn't https; not fetching it.")
+    req = urllib.request.Request(url, headers={"User-Agent": RENDER_HTTP_UA})
+    last = None
+    for _ in range(3):  # retrying the download is free; retrying the render is not
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception as e:
+            last = e
+            time.sleep(1)
+    raise last
+
+
+def _file_get(fid):
+    return _xai("GET", f"/files/{urllib.parse.quote(fid, safe='')}/content", raw=True)
+
+
+def _file_put(data, filename, mime):
+    boundary = "kira" + secrets.token_hex(12)
+    body = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n").encode() + data + f"\r\n--{boundary}--\r\n".encode()
+    r = _xai("POST", "/files", body, f"multipart/form-data; boundary={boundary}", timeout=120)
+    fid = r.get("id") if isinstance(r, dict) else None
+    if not isinstance(fid, str) or not fid:
+        raise ToolError("xAI's Files API didn't return a file id.")
+    return fid
+
+
+def _file_del(fid):
+    try:
+        _xai("DELETE", f"/files/{urllib.parse.quote(fid, safe='')}", timeout=30)
+    except Exception:
+        pass  # best effort; a leftover file costs nothing to spend
+
+
+def _mime(data):
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _data_uri(data):
+    return f"data:{_mime(data)};base64," + base64.b64encode(data).decode()
+
+
+def _render_ready():
+    if not XAI_KEY:
+        raise ToolError("Renders aren't set up yet: XAI_API_KEY is missing on the server.")
+    if not XAI_REF_FILES:
+        raise ToolError("Renders aren't set up yet: XAI_REF_FILES (the reference image file ids) is missing.")
+
+
+@server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def render_quote(prompt: str, edit_of: str | None = None) -> str:
+    """Price a Grok Imagine render of Kira. Free: nothing is sent to xAI. Nick's two
+    reference images are always included, so her face and body stay consistent.
+    prompt: the full image prompt (the scene, outfit, pose; or, for an edit, the change).
+    edit_of: optional; a render id (from render_image) or a closet look name that has a
+    stored render, to edit that image instead of starting fresh ("same outfit, seen from
+    the back"). Looks rendered in the Grok app can't be edited here.
+    Returns a quote id good for 10 minutes. Show Nick the price and wait for his yes to
+    this render before calling render_image."""
+    _render_ready()
+    p = (prompt or "").strip()
+    if not p:
+        raise ToolError("The prompt is empty.")
+    if len(p) > RENDER_PROMPT_MAX:
+        raise ToolError(f"The prompt is too long ({len(p)} characters; max {RENDER_PROMPT_MAX}).")
+    r = _render_now()
+    target = None
+    if edit_of:
+        target = _render_find(r["items"], edit_of)
+        if not target or not target.get("file_id"):
+            raise ToolError(f"No stored render for {edit_of!r}. Only renders made with render_image "
+                            "can be edited here; Grok-app renders can't yet.")
+    n = len(XAI_REF_FILES) + (1 if target else 0)
+    if n > RENDER_MAX_IMAGES:
+        raise ToolError(f"That's {n} input images; xAI takes at most {RENDER_MAX_IMAGES}.")
+    est = round(n * RENDER_INPUT_USD + RENDER_OUTPUT_USD_EST, 2)
+    left = RENDER_DAILY_CAP - _usd(r["spent"])
+    if est > left + 1e-9:
+        raise ToolError(f"That would pass today's ${RENDER_DAILY_CAP:.2f} render cap "
+                        f"(${max(left, 0):.2f} left). Nothing was spent.")
+    now = time.time()
+    for k in [k for k, v in _quotes.items() if v["expires"] < now]:
+        del _quotes[k]
+    qid = "q" + secrets.token_hex(3)
+    _quotes[qid] = {"prompt": p, "est": est, "expires": now + RENDER_QUOTE_TTL_S,
+                    "target_id": target["id"] if target else None,
+                    "target_file": target["file_id"] if target else None}
+    what = f"an edit of {target.get('look') or target['id']}" if target else "a new render"
+    return (f"Quote {qid}: {what}, about ${est:.2f} ({n} input images + 1 output). "
+            f"${max(left, 0):.2f} of today's ${RENDER_DAILY_CAP:.2f} left. Billed even if xAI's "
+            f"moderation withholds the image. Good for 10 minutes. Call render_image with "
+            f"quote_id={qid} only after Nick says yes to this.")
+
+
+@server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                                         idempotentHint=False, openWorldHint=True))
+def render_image(quote_id: str):
+    """SPENDS MONEY. Runs a render priced by render_quote. Call it only after Nick has said
+    yes to that quote in this conversation, once per yes. Never retry it on your own: a
+    retry can bill twice. Returns the image, a short-lived link Nick can open, the actual
+    cost and a render id. The render waits as 'pending' until render_review."""
+    _render_ready()
+    q = _quotes.pop((quote_id or "").strip(), None)
+    if not q or q["expires"] < time.time():
+        raise ToolError("That quote is unknown or expired (quotes last 10 minutes). Get a new "
+                        "quote; nothing was spent.")
+    est = int(round(q["est"] * TICKS_PER_USD))
+    now = int(time.time())
+    with _render_lock:
+        r = _render_now()
+        if _usd(r["spent"] + est) > RENDER_DAILY_CAP + 1e-9:
+            raise ToolError(f"Today's ${RENDER_DAILY_CAP:.2f} render cap would be passed. Nothing was spent.")
+        if len(r["items"]) >= RENDER_ITEMS_MAX:
+            raise ToolError("The render ledger is full; reject or file some renders first.")
+        rid = "r" + secrets.token_hex(3)
+        r["items"].append({"id": rid, "status": "running", "created": now, "cost": est,
+                           "prompt": q["prompt"][:RENDER_PROMPT_KEEP], "edit_of": q["target_id"],
+                           "file_id": None, "look": None, "note": ""})
+        r["spent"] += est
+        r["count"] += 1
+        doomed = _render_prune(r, now)
+        _render_save(r)  # the attempt is on the books before xAI is called
+    for fid in doomed:
+        _file_del(fid)
+
+    sent, cost, status, img, url, file_id, err = False, est, "failed", None, None, None, ""
+    try:
+        images = []
+        if q["target_file"]:
+            images.append(_data_uri(_file_get(q["target_file"])))
+        for fid in XAI_REF_FILES:
+            if fid not in _ref_cache:
+                _ref_cache[fid] = _file_get(fid)
+            images.append(_data_uri(_ref_cache[fid]))
+        body = json.dumps({"model": XAI_MODEL, "prompt": q["prompt"],
+                           "images": [{"type": "image_url", "url": u} for u in images]}).encode()
+        sent = True
+        resp = _xai("POST", "/images/edits", body, timeout=240)
+        ticks = (resp.get("usage") or {}).get("cost_in_usd_ticks") if isinstance(resp, dict) else None
+        if isinstance(ticks, int) and ticks >= 0:
+            cost = ticks
+        data = resp.get("data") if isinstance(resp, dict) else None
+        first = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
+        url = first.get("url") if isinstance(first.get("url"), str) else None
+        if first.get("b64_json"):
+            img = base64.b64decode(first["b64_json"])
+        elif url:
+            img = _fetch_public(url)
+        if not img:
+            status = "withheld"
+        else:
+            status = "pending"
+            try:
+                file_id = _file_put(img, f"{rid}.{_mime(img).split('/')[1]}", _mime(img))
+            except Exception as e:
+                status, err = "unsaved", (_xai_reason(e) if isinstance(e, _XaiError) else str(e))
+    except _XaiError as e:
+        err = _xai_reason(e)
+        status = "failed"
+        if not sent:
+            cost = 0
+    except ToolError as e:
+        err, status = str(e), ("unknown" if sent else "failed")
+        if not sent:
+            cost = 0
+    except Exception as e:
+        err, status = f"{type(e).__name__}: {e}", ("unknown" if sent else "failed")
+        if not sent:
+            cost = 0
+
+    ledger_note = ""
+    try:
+        with _render_lock:
+            r = _render_now()
+            for i in r["items"]:
+                if i["id"] == rid:
+                    i.update(status=status, cost=cost, file_id=file_id)
+            r["spent"] = max(0, r["spent"] + cost - est)
+            _render_save(r)
+    except Exception:
+        ledger_note = " (Couldn't update the render ledger; today's total may be off.)"
+
+    money = f"${_usd(cost):.2f}"
+    if status == "pending":
+        link = f" Link (expires soon): {url}" if url else ""
+        return [f"Render {rid} done, {money}. It's pending: approve it with render_review "
+                f"(and a closet name) or reject it.{link}{ledger_note}",
+                Image(data=img, format=_mime(img).split("/")[1])]
+    if status == "unsaved":
+        link = f" Link (expires soon): {url}" if url else ""
+        return [f"Render {rid} done, {money}, but saving it to xAI's file storage failed ({err}), "
+                f"so it can't be approved into the closet or edited later. Nick can still save it "
+                f"from the link.{link}{ledger_note}",
+                Image(data=img, format=_mime(img).split("/")[1])]
+    if status == "withheld":
+        raise ToolError(f"xAI's moderation withheld render {rid}; it was still billed ({money}). "
+                        f"Don't retry the same prompt.{ledger_note}")
+    if status == "unknown":
+        raise ToolError(f"Render {rid} may or may not have run ({err}). It may have been billed; "
+                        f"check the xAI console before trying again. Don't retry on your own.{ledger_note}")
+    raise ToolError(f"Render {rid} failed: {err}. "
+                    f"{'Nothing was spent.' if cost == 0 else 'It may have been billed.'}{ledger_note}")
+
+
+@server.tool()
+def render_review(render_id: str, decision: Literal["approve", "reject"],
+                  name: str | None = None, note: str = "") -> str:
+    """Approve or reject a pending render. approve needs name: the look's closet name
+    (new, not already in the closet) and optionally note (outfit, pose, vibe), as for
+    add_den_look. Approved renders land in the closet the next time the den page is open.
+    reject deletes the render from xAI's storage right away."""
+    with _render_lock:
+        r = _render_now()
+        item = _render_find(r["items"], render_id, statuses=("pending",))
+        if not item or item["id"] != (render_id or "").strip():
+            raise ToolError(f"No pending render {render_id!r}.")
+        if decision == "reject":
+            fid = item.get("file_id")
+            item.update(status="rejected", file_id=None)
+            _render_save(r)
+            if fid:
+                _file_del(fid)
+            return f"Rejected {item['id']}; deleted from xAI."
+        clean = _clean_line(name or "", DEN_LOOK_NAME_MAX)
+        if not clean:
+            raise ToolError("Approving needs a closet name for the look.")
+        if not item.get("file_id"):
+            raise ToolError("That render wasn't saved to xAI's storage, so it can't go to the closet.")
+        if _find_look(_closet_now(), clean) or any(
+                (i.get("look") or "").casefold() == clean.casefold() and i is not item
+                and i.get("status") in ("approved", "filed") for i in r["items"]):
+            raise ToolError(f"A look named {clean!r} already exists; pick another name.")
+        item.update(status="approved", look=clean, note=_clean_line(note or "", DEN_LOOK_NOTE_MAX))
+        _render_save(r)
+    return f"Approved {item['id']} as {clean!r}. It goes into the closet the next time the den page is open."
+
+
+@server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def render_inbox() -> dict:
+    """For the den page: approved renders waiting to be saved into the closet
+    (renders: [{id, name, note, created}])."""
+    r = _render_now()
+    return {"renders": [{"id": i["id"], "name": i["look"], "note": i.get("note", ""),
+                         "created": i.get("created")}
+                        for i in r["items"] if i.get("status") == "approved"]}
+
+
+@server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+def render_fetch(render_id: str) -> dict:
+    """For the den page: one approved render's image as base64 ({id, name, note, mime, b64})."""
+    r = _render_now()
+    item = _render_find(r["items"], render_id, statuses=("approved", "filed"))
+    if not item or item["id"] != (render_id or "").strip() or not item.get("file_id"):
+        raise ToolError(f"No approved render {render_id!r}.")
+    try:
+        data = _file_get(item["file_id"])
+    except _XaiError as e:
+        raise ToolError(_xai_reason(e)) from None
+    return {"id": item["id"], "name": item["look"], "note": item.get("note", ""),
+            "mime": _mime(data), "b64": base64.b64encode(data).decode()}
+
+
+@server.tool()
+def render_filed(render_id: str) -> str:
+    """For the den page: mark an approved render as saved into the closet. Its xAI copy is
+    kept so the look can be edited later, until the look is removed from the closet."""
+    with _render_lock:
+        r = _render_now()
+        item = _render_find(r["items"], render_id, statuses=("approved",))
+        if not item or item["id"] != (render_id or "").strip():
+            raise ToolError(f"No approved render {render_id!r}.")
+        item["status"] = "filed"
+        _render_save(r)
+    return f"{item['look']!r} is filed."
+
+
+def _render_forget_look(name):
+    """When a look leaves the closet, delete its stored render at xAI too. Best effort."""
+    try:
+        with _render_lock:
+            r = _render_now()
+            gone = [i for i in r["items"] if (i.get("look") or "").casefold() == name.casefold()
+                    and i.get("status") in ("approved", "filed")]
+            if not gone:
+                return
+            r["items"] = [i for i in r["items"] if not any(i is g for g in gone)]
+            _render_save(r)
+        for i in gone:
+            if i.get("file_id"):
+                _file_del(i["file_id"])
+    except Exception:
+        pass  # removing the look already worked; a leftover file is harmless
 
 
 # ---------------------------------------------------------------------------
