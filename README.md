@@ -14,6 +14,8 @@ There are no secrets in this repo. Everything private comes from environment var
 | `XAI_API_KEY` | optional: the xAI key for renders (image + files permissions only) |
 | `XAI_REF_FILES` | optional: the two reference images' xAI file ids, comma-separated (`tools/upload-refs.sh` prints them) |
 | `RENDER_DAILY_CAP_USD` | optional: render spend cap per Chicago day, default `0.50` |
+| `XAI_IMAGE_RESOLUTION` | optional: `1k` or `2k`; unset sends nothing (xAI uses 1k). `2k` raises the quote estimate by about $0.02 |
+| `XAI_IMAGE_QUALITY` | optional: `low`, `medium` or `auto`; unset sends nothing (xAI's auto is medium for edits) |
 
 **Renders:** `render_quote` (free) prices a Grok Imagine render with the reference images; `render_image` runs it only after Nick says yes, `render_review` approves (with a closet name) or rejects it, and the den page collects approved ones with `render_inbox` / `render_fetch` / `render_filed`. The spend ledger is the retained `den/renders` message; prompts and images never go in this repo.
 

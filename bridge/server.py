@@ -779,13 +779,24 @@ def resolve_den_suggestion(name: str, status: str) -> str:
 # are kept in xAI's Files API by file id. The key is only ever sent to api.x.ai.
 #
 # Env: XAI_API_KEY (needs image + files permissions), XAI_REF_FILES (comma-separated
-# file ids of the reference images), optional RENDER_DAILY_CAP_USD (default 0.50) and
-# XAI_IMAGE_MODEL (default grok-imagine-image-2.0). Without the key or references the
-# render tools say so; every other tool works as before.
+# file ids of the reference images), optional RENDER_DAILY_CAP_USD (default 0.50),
+# XAI_IMAGE_MODEL (default grok-imagine-image-2.0), XAI_IMAGE_RESOLUTION (1k or 2k; unset
+# sends nothing, so xAI uses 1k) and XAI_IMAGE_QUALITY (low, medium or auto; unset sends
+# nothing, and xAI's auto is medium for edits). Without the key or references the render
+# tools say so; every other tool works as before.
 # ---------------------------------------------------------------------------
 XAI_KEY = os.environ.get("XAI_API_KEY", "").strip()
 XAI_BASE = "https://api.x.ai/v1"
 XAI_MODEL = os.environ.get("XAI_IMAGE_MODEL", "grok-imagine-image-2.0").strip()
+# Optional output settings, sent only when set. Values outside xAI's documented ones are
+# ignored rather than sent. xAI's docs don't say whether the edits endpoint honors
+# resolution, so check the first 2k render's pixel size.
+XAI_RESOLUTION = os.environ.get("XAI_IMAGE_RESOLUTION", "").strip().lower()
+if XAI_RESOLUTION not in ("", "1k", "2k"):
+    XAI_RESOLUTION = ""
+XAI_QUALITY = os.environ.get("XAI_IMAGE_QUALITY", "").strip().lower()
+if XAI_QUALITY not in ("", "low", "medium", "auto"):
+    XAI_QUALITY = ""
 XAI_REF_FILES = [f.strip() for f in os.environ.get("XAI_REF_FILES", "").split(",") if f.strip()]
 try:
     RENDER_DAILY_CAP = float(os.environ.get("RENDER_DAILY_CAP_USD", "0.50"))
@@ -797,6 +808,7 @@ RENDER_PROMPT_KEEP = 300          # how much of a prompt the ledger remembers
 RENDER_MAX_IMAGES = 3             # xAI's widely documented limit (one page says 5)
 RENDER_INPUT_USD = 0.01
 RENDER_OUTPUT_USD_EST = 0.06      # seen Nov 5 at default quality; the real cost comes back in usage
+RENDER_2K_EXTRA_USD_EST = 0.02    # list-price gap between 1k and 2k medium (reseller tables); an estimate
 TICKS_PER_USD = 10_000_000_000    # usage.cost_in_usd_ticks: the $0.08 test came back as 800000000
 RENDER_QUOTE_TTL_S = 600
 RENDER_PENDING_DAYS = 7           # unreviewed renders are deleted at xAI after this
@@ -953,6 +965,10 @@ def _data_uri(data):
     return f"data:{_mime(data)};base64," + base64.b64encode(data).decode()
 
 
+def _render_output_est():
+    return RENDER_OUTPUT_USD_EST + (RENDER_2K_EXTRA_USD_EST if XAI_RESOLUTION == "2k" else 0)
+
+
 def _render_ready():
     if not XAI_KEY:
         raise ToolError("Renders aren't set up yet: XAI_API_KEY is missing on the server.")
@@ -986,7 +1002,7 @@ def render_quote(prompt: str, edit_of: str | None = None) -> str:
     n = len(XAI_REF_FILES) + (1 if target else 0)
     if n > RENDER_MAX_IMAGES:
         raise ToolError(f"That's {n} input images; xAI takes at most {RENDER_MAX_IMAGES}.")
-    est = round(n * RENDER_INPUT_USD + RENDER_OUTPUT_USD_EST, 2)
+    est = round(n * RENDER_INPUT_USD + _render_output_est(), 2)
     left = RENDER_DAILY_CAP - _usd(r["spent"])
     if est > left + 1e-9:
         raise ToolError(f"That would pass today's ${RENDER_DAILY_CAP:.2f} render cap "
@@ -1045,8 +1061,13 @@ def render_image(quote_id: str):
             if fid not in _ref_cache:
                 _ref_cache[fid] = _file_get(fid)
             images.append(_data_uri(_ref_cache[fid]))
-        body = json.dumps({"model": XAI_MODEL, "prompt": q["prompt"],
-                           "images": [{"type": "image_url", "url": u} for u in images]}).encode()
+        payload = {"model": XAI_MODEL, "prompt": q["prompt"],
+                   "images": [{"type": "image_url", "url": u} for u in images]}
+        if XAI_RESOLUTION:
+            payload["resolution"] = XAI_RESOLUTION
+        if XAI_QUALITY:
+            payload["quality"] = XAI_QUALITY
+        body = json.dumps(payload).encode()
         sent = True
         resp = _xai("POST", "/images/edits", body, timeout=240)
         ticks = (resp.get("usage") or {}).get("cost_in_usd_ticks") if isinstance(resp, dict) else None
