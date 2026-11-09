@@ -473,9 +473,29 @@ def den_snapshot():
     return body
 
 
+DEN_URL = "https://claude.ai/artifact/6MKW6A3BmWvEWCi1apXykW"
+
+
+def _den_moved():
+    """Nov 8: the den keeps its own data in the den artifact's database, so the morning task
+    and Kira chats no longer depend on this server. The old write tools stay registered only
+    to point callers there."""
+    raise ToolError(
+        "The den moved on Nov 8: it keeps its own data now, and nothing was changed here. "
+        "Write to the den artifact's database with the ArtifactData tool (load it with ToolSearch "
+        f"\"select:ArtifactData\" if it's deferred), url {DEN_URL}. Today's look, screen, brief and "
+        "weather are fields of collection \"den\", doc_id \"today\" (read it first and pass its version "
+        "as if_version; use action \"update\" to change only some fields). The closet is collection "
+        "\"looks\" (set retired true/false to take a look out of or back into rotation; don't create "
+        "looks, they need an image). Pitches are collection \"wishlist\" (doc_id = slug of the name; "
+        "status open, cut or rendered).")
+
+
 @server.tool(name="den_state", annotations=ToolAnnotations(readOnlyHint=True))
 def den_state_tool() -> dict:
-    """Read everything Kira's private den page shows: the room's mood (mood, source,
+    """MOOD ONLY since Nov 8: mood, source and online are current; everything else here is a
+    frozen copy from before the den moved to its artifact (read collection "den", doc "today",
+    "looks" and "wishlist" there with ArtifactData instead). Originally: everything Kira's private den page shows: the room's mood (mood, source,
     updated: Kira's own last set_mood color while it lasts, otherwise the clock; online
     only says whether the Cube is plugged in), the THINKING ABOUT lines (screen), today's look (look), the morning
     brief (brief: {markdown, set}), the closet of rendered looks (closet: [{name, note,
@@ -489,7 +509,8 @@ def den_state_tool() -> dict:
 
 @server.tool(name="den_summary", annotations=ToolAnnotations(readOnlyHint=True))
 def den_summary_tool() -> dict:
-    """Light read of the den: today's look, the THINKING ABOUT lines (screen), the weather,
+    """FROZEN since Nov 8 except mood/source/online: the den's content lives in its artifact's
+    database now (ArtifactData). Originally: light read of the den: today's look, the THINKING ABOUT lines (screen), the weather,
     the room's mood, when the brief was last set (brief_set, a Unix timestamp), and counts
     for the closet and open Wishlist pitches. It leaves out the brief text, the closet
     notes and the Wishlist prompts, so it is much cheaper than den_state. Use it for
@@ -516,6 +537,7 @@ def set_den_screen(items: list[str]) -> str:
     """Put the day's THINKING ABOUT lines on Kira's den page. Pass 1-4 short lines
     (3-6 words each works best), exactly as they should read on the screen. They replace
     whatever was there and stay until the next call."""
+    _den_moved()
     clean = [_clean_screen_item(i) for i in items if isinstance(i, str)]
     clean = [i for i in clean if i]
     if not clean:
@@ -547,6 +569,7 @@ def _find_look(closet, name):
 def set_den_look(name: str) -> str:
     """Choose today's look on Kira's den page. `name` must match a look in the closet
     (see den_state's closet list; case doesn't matter)."""
+    _den_moved()
     closet = _closet_now()
     item = _find_look(closet, name)
     if not item:
@@ -562,6 +585,7 @@ def add_den_look(name: str, note: str = "") -> str:
     """Add a rendered look to the den's closet (or update its note if it's already there).
     The den page calls this when Nick uploads a render; `note` is a short description the
     morning task can use when picking (outfit, pose, vibe)."""
+    _den_moved()
     clean = _clean_line(name or "", DEN_LOOK_NAME_MAX)
     if not clean:
         raise ToolError("Give the look a name.")
@@ -583,6 +607,7 @@ def add_den_look(name: str, note: str = "") -> str:
 def remove_den_look(name: str) -> str:
     """Take a look out of the den's closet (the render itself stays in the den page's
     storage). If it was today's look, the page falls back to the empty room."""
+    _den_moved()
     closet = _closet_now()
     item = _find_look(closet, name)
     if not item:
@@ -602,6 +627,7 @@ def set_den_brief(markdown: str) -> str:
     """Post the morning brief (weather, outfit picks, news) to Kira's den page, below the
     room. Markdown: headings, bold, bullet lists and links render. Replaces the previous
     brief."""
+    _den_moved()
     md = (markdown or "").strip()
     if not md:
         raise ToolError("The brief is empty.")
@@ -618,6 +644,7 @@ def set_den_weather(sky: str, temp_f: int | None = None) -> str:
     """Set today's Chicago sky for Kira's den: the city screen rains, drizzles, storms,
     snows or clears to match, and a cold temp_f frosts the glass. sky is one of clear,
     cloudy, drizzle, rain, storm, snow. The morning brief task sets it from the forecast."""
+    _den_moved()
     sky = (sky or "").strip().lower()
     if sky not in DEN_SKIES:
         raise ToolError(f"sky must be one of: {', '.join(DEN_SKIES)}.")
@@ -640,6 +667,7 @@ def den_update(look: str | None = None, screen: list[str] | None = None,
     anything is written, so a bad argument changes nothing. Parts you leave out stay as
     they are. The single-purpose tools (set_den_look, set_den_screen, set_den_weather,
     set_den_brief) still work the same way."""
+    _den_moved()
     if look is None and screen is None and sky is None and brief is None:
         raise ToolError("Pass at least one of look, screen, sky or brief.")
     if temp_f is not None and sky is None:
@@ -717,6 +745,7 @@ def add_den_suggestion(name: str, pitch: str, prompt: str) -> str:
     full ready-to-paste Grok image prompt (base block, outfit, den setting, pose,
     expression, style lock, negatives). Nick copies the prompt to render it, or cuts it.
     Names he has cut or already rendered are refused, so nothing is pitched twice."""
+    _den_moved()
     clean = _clean_line(name or "", DEN_LOOK_NAME_MAX)
     if not clean:
         raise ToolError("Give the pitch a name.")
@@ -750,6 +779,7 @@ def add_den_suggestion(name: str, pitch: str, prompt: str) -> str:
 def resolve_den_suggestion(name: str, status: str) -> str:
     """Close a Wishlist pitch. status 'cut' = Nick passed ("not my vibe"; never pitch it
     again), 'rendered' = he made it and it's in the closet now, 'open' = put it back."""
+    _den_moved()
     status = (status or "").strip().lower()
     if status not in DEN_WISH_STATUSES:
         raise ToolError(f"status must be one of: {', '.join(DEN_WISH_STATUSES)}.")
